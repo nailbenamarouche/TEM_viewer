@@ -805,6 +805,13 @@ class ROITracker:
     def __init__(self, min_size=32, max_size=512):
         self.min_size = min_size
         self.max_size = max_size
+        # Native max pixel value of the source video (255 or 65535) - kept
+        # in sync by TEMVideoProcessor._load_video. cv2.matchTemplate only
+        # supports 8-bit or float32 images, so 16-bit frames must be
+        # rescaled down to 8-bit using this before matching; using a
+        # hardcoded 255 clip instead of this would crush all 16-bit values
+        # above 255 to white and destroy the template's contrast entirely.
+        self.max_val = 255
         self.selecting = False
         self.selection_start = None
         self.selection_end = None
@@ -921,7 +928,12 @@ class ROITracker:
             return False
 
         if frame.dtype != np.uint8:
-            self.template = np.clip(frame[y1:y2, x1:x2], 0, 255).astype(np.uint8)
+            # Scale by the frame's actual max value, not a hardcoded 255 -
+            # clipping raw 16-bit values at 255 would crush nearly all of a
+            # typical 16-bit frame to solid white before matchTemplate ever
+            # sees it (matchTemplate only accepts 8-bit or float32 input).
+            crop = frame[y1:y2, x1:x2].astype(np.float32) * (255.0 / self.max_val)
+            self.template = np.clip(crop, 0, 255).astype(np.uint8)
         else:
             self.template = frame[y1:y2, x1:x2].copy()
 
@@ -973,7 +985,10 @@ class ROITracker:
             return self.last_dx, self.last_dy, 0.0
 
         if frame.dtype != np.uint8:
-            frame_u8 = np.clip(frame, 0, 255).astype(np.uint8)
+            # Same rescale-by-actual-range fix as on_mouse_up above, applied
+            # to the live search region so it stays comparable to the
+            # (also rescaled) locked template.
+            frame_u8 = np.clip(frame.astype(np.float32) * (255.0 / self.max_val), 0, 255).astype(np.uint8)
         else:
             frame_u8 = frame
 
@@ -1041,6 +1056,100 @@ class ROITracker:
 
 
 # ============================================================
+# RAW FFMPEG VIDEO READER - for lossless (16-bit) sources
+# ============================================================
+
+class RawFFmpegVideoReader:
+    """Reads raw grayscale frames directly from a video file via an ffmpeg
+    subprocess pipe, bypassing cv2.VideoCapture.
+
+    cv2.VideoCapture always decodes to 8-bit BGR - for an 8-bit source
+    that's harmless, but for a 16-bit lossless (gray16le/FFV1) source it
+    would silently throw away the lower 8 bits of every pixel before this
+    app ever sees them. This reader instead pipes ffmpeg's own rawvideo
+    output straight into a numpy array at its native dtype, so 16-bit data
+    stays 16-bit all the way into the processing pipeline.
+
+    FFV1 is intra-only (every frame is its own keyframe), and modern ffmpeg
+    resolves an input-side `-ss` before `-i` to the exact requested frame
+    (not just the nearest earlier keyframe), so seeking here is both cheap
+    and frame-accurate.
+    """
+
+    def __init__(self, path, width, height, pix_fmt, fps, total_frames):
+        self.path = path
+        self.width = width
+        self.height = height
+        self.pix_fmt = pix_fmt
+        self.dtype = np.uint16 if pix_fmt in ('gray16le', 'gray16be') else np.uint8
+        self._bytes_per_pixel = 2 if self.dtype == np.uint16 else 1
+        self._frame_size = width * height * self._bytes_per_pixel
+        self.fps = fps if fps > 0 else 25.0
+        self.total_frames = total_frames
+        self.current_frame = -1
+        self.proc = None
+        self._start_process(0)
+
+    def _start_process(self, frame_num):
+        self._close_process()
+        cmd = ['ffmpeg', '-v', 'error']
+        if frame_num > 0:
+            seek_time = frame_num / self.fps
+            cmd += ['-ss', f'{seek_time:.6f}']
+        cmd += [
+            '-i', self.path,
+            '-f', 'rawvideo',
+            '-pix_fmt', self.pix_fmt,
+            '-vcodec', 'rawvideo',
+            '-'
+        ]
+        self.proc = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            bufsize=self._frame_size * 4
+        )
+        self.current_frame = frame_num - 1  # next successful read() lands on frame_num
+
+    def _close_process(self):
+        if self.proc is not None:
+            try:
+                self.proc.stdout.close()
+            except Exception:
+                pass
+            try:
+                self.proc.kill()
+                self.proc.wait(timeout=2)
+            except Exception:
+                pass
+            self.proc = None
+
+    def _read_raw(self):
+        buf = b''
+        while len(buf) < self._frame_size:
+            chunk = self.proc.stdout.read(self._frame_size - len(buf))
+            if not chunk:
+                break
+            buf += chunk
+        if len(buf) < self._frame_size:
+            return None
+        return np.frombuffer(buf, dtype=self.dtype).reshape(self.height, self.width).copy()
+
+    def read_frame(self, frame_num):
+        """Returns the requested frame as a 2D array of native dtype, or
+        None if it couldn't be read (end of stream, decode failure)."""
+        frame_num = max(0, min(frame_num, self.total_frames - 1))
+        if frame_num != self.current_frame + 1:
+            self._start_process(frame_num)
+        arr = self._read_raw()
+        if arr is None:
+            return None
+        self.current_frame = frame_num
+        return arr
+
+    def release(self):
+        self._close_process()
+
+
+# ============================================================
 # TEM PROCESSOR - COMPLETE (UNTOUCHED)
 # ============================================================
 
@@ -1052,8 +1161,15 @@ class TEMProcessor:
     def __init__(self):
         self.drift_x = 0.0
         self.drift_y = 0.0
+        # Native max pixel value of frames being processed - 255 for 8-bit
+        # sources, 65535 for 16-bit lossless sources. Every LUT below is
+        # sized/rebuilt from this, so switching videos must update it
+        # (see TEMVideoProcessor._load_video) or LUT-based ops below would
+        # silently clip a 16-bit frame's data into an 8-bit range.
+        self.max_val = 255
         self.gamma_lut = None
         self.gamma_value = None
+        self.gamma_lut_max_val = None
         self.duplicate_count = 0
         self.consecutive_dups = 0
         self.frame_count = 0
@@ -1139,20 +1255,24 @@ class TEMProcessor:
         if rebuild:
             small = image
             low, high = np.percentile(small, [self.autocontrast_low_pct, self.autocontrast_high_pct])
+            max_val = self.max_val
+            lut_dtype = np.uint8 if max_val <= 255 else np.uint16
             if high > low:
                 self.autocontrast_lut = np.clip(
-                    (np.arange(256, dtype=np.float32) - low) * 255.0 / (high - low),
-                    0, 255
-                ).astype(np.uint8)
+                    (np.arange(max_val + 1, dtype=np.float64) - low) * max_val / (high - low),
+                    0, max_val
+                ).astype(lut_dtype)
             else:
-                self.autocontrast_lut = np.arange(256, dtype=np.uint8)
+                self.autocontrast_lut = np.arange(max_val + 1, dtype=lut_dtype)
             self.autocontrast_built = True
             self.autocontrast_last_build_frame = self.frame_count
             self.autocontrast_last_mean = current_mean
 
-        if image.dtype != np.uint8:
-            image = np.clip(image, 0, 255).astype(np.uint8)
-        return cv2.LUT(image, self.autocontrast_lut)
+        if image.dtype == np.uint8:
+            # cv2.LUT only accepts 8-bit source images, so the 16-bit path
+            # below uses plain numpy fancy indexing instead.
+            return cv2.LUT(image, self.autocontrast_lut)
+        return self.autocontrast_lut[image]
 
     def apply_clahe(self, image):
         """Applies CLAHE (contrast-limited adaptive histogram equalization).
@@ -1163,8 +1283,12 @@ class TEMProcessor:
         Returns:
             The equalized image.
         """
-        if image.dtype != np.uint8:
-            image = np.clip(image, 0, 255).astype(np.uint8)
+        # cv2's CLAHE natively supports both CV_8UC1 and CV_16UC1, so a
+        # 16-bit frame is passed through untouched - this used to force
+        # everything to uint8 here regardless of source depth, which was a
+        # silent truncation point for 16-bit lossless frames.
+        if image.dtype not in (np.uint8, np.uint16):
+            image = np.clip(image, 0, self.max_val).astype(np.uint8 if self.max_val <= 255 else np.uint16)
         return self.clahe.apply(image)
 
     def apply_gamma_fast(self, image, gamma=1.0):
@@ -1178,13 +1302,18 @@ class TEMProcessor:
             The gamma-corrected image.
         """
         if gamma == 1.0:
-            return image.astype(np.uint8) if image.dtype != np.uint8 else image.copy()
-        if self.gamma_lut is None or self.gamma_value != gamma:
+            return image.copy()
+        max_val = self.max_val
+        if self.gamma_lut is None or self.gamma_value != gamma or self.gamma_lut_max_val != max_val:
             self.gamma_value = gamma
-            self.gamma_lut = np.array([(i / 255.0) ** gamma * 255 for i in np.arange(0, 256)]).astype("uint8")
-        if image.dtype != np.uint8:
-            image = np.clip(image, 0, 255).astype(np.uint8)
-        return cv2.LUT(image, self.gamma_lut)
+            self.gamma_lut_max_val = max_val
+            lut_dtype = np.uint8 if max_val <= 255 else np.uint16
+            self.gamma_lut = (
+                ((np.arange(0, max_val + 1) / max_val) ** gamma) * max_val
+            ).astype(lut_dtype)
+        if image.dtype == np.uint8:
+            return cv2.LUT(image, self.gamma_lut)
+        return self.gamma_lut[image]
 
 
 # ============================================================
@@ -1526,6 +1655,12 @@ class TEMVideoProcessor(QMainWindow):
         self.source_frames = 0
         self.width = 1024
         self.height = 1024
+        # Set when the opened file is a 16-bit lossless (gray16le) source -
+        # bypasses cv2.VideoCapture (which only ever decodes to 8-bit BGR)
+        # in favor of piping raw frames straight from ffmpeg.
+        self._raw_reader: Optional[RawFFmpegVideoReader] = None
+        self.bit_depth = 8
+        self.max_val = 255
         self.current_frame = 0
         self.video_loaded = False
         self._video_error = False
@@ -1670,8 +1805,12 @@ class TEMVideoProcessor(QMainWindow):
                 resized_note = f" (resized from {orig_w}x{orig_h} to {target_w}x{target_h})"
             D = D.astype(np.float32)
             F = F.astype(np.float32)
-            if F.max() > 255:
-                F = F * 255.0 / F.max()
+            # Flag: this used to hardcode a 0-255 target range, so a 16-bit
+            # reference image would get rescaled down to 8-bit-equivalent
+            # values even when the loaded video is itself 16-bit - normalize
+            # against the video's actual native range instead.
+            if F.max() > self.max_val:
+                F = F * float(self.max_val) / F.max()
             FD = F - D
             mean_FD = np.mean(FD)
             # Per-pixel gain = (mean of F-D) / (that pixel's F-D), i.e. how
@@ -1771,6 +1910,15 @@ class TEMVideoProcessor(QMainWindow):
         self.frame_info_label.setObjectName("frame_info")
         header_layout.addWidget(self.frame_info_label)
 
+        self.bitdepth_label = QLabel("")
+        self.bitdepth_label.setObjectName("frame_info")
+        self.bitdepth_label.setToolTip(
+            "8-BIT: source decodes via OpenCV as ordinary 8-bit video.\n"
+            "16-BIT NATIVE: source is a lossless gray16le file, read via a\n"
+            "raw ffmpeg pipe so full precision is kept through processing."
+        )
+        header_layout.addWidget(self.bitdepth_label)
+
         header_layout.addStretch()
 
         self.status_label = QLabel("IDLE")
@@ -1836,6 +1984,16 @@ class TEMVideoProcessor(QMainWindow):
         controls_layout.addWidget(self.add_segment_btn)
 
         controls_layout.addStretch()
+
+        self.export_mode_combo = QComboBox()
+        self.export_mode_combo.addItems(["LOSSY H.265", "LOSSLESS FFV1"])
+        self.export_mode_combo.setToolTip(
+            "LOSSY H.265: small files, always 8-bit output - a 16-bit source\n"
+            "gets truncated to 8 bits here.\n"
+            "LOSSLESS FFV1: encodes at the frames' current dtype (8- or\n"
+            "16-bit) with no compression loss. Much larger files, .mkv output."
+        )
+        controls_layout.addWidget(self.export_mode_combo)
 
         self.export_btn = QPushButton("EXPORT")
         self.export_btn.setObjectName("primary")
@@ -2380,13 +2538,108 @@ QLabel#fps_display {{
     def _open_video(self):
         if self._loading_video:
             return
-            
+
         path, _ = QFileDialog.getOpenFileName(
             self, "Open Video", "",
             "Video Files (*.mp4 *.mkv *.avi *.mov *.wmv);;All Files (*.*)"
         )
         if path:
             self._load_video(path)
+
+    def _probe_video_format(self, path):
+        """Best-effort ffprobe query for width/height/pixel format/fps/frame
+        count. Returns None on any failure (ffprobe missing, unreadable
+        file, unexpected output) so callers always have a safe fallback to
+        the existing cv2.VideoCapture path - a missing ffprobe must never
+        break ordinary video loading.
+
+        NOTE: frame count/duration must never be the reason this returns
+        None - a container like FFV1-in-MKV routinely reports both
+        stream-level `nb_frames` and `duration` as "N/A" without a full
+        decode pass, but that's just missing metadata, not a reason to fall
+        back to the 8-bit cv2.VideoCapture path and silently lose bit depth.
+        """
+        try:
+            result = subprocess.run(
+                ['ffprobe', '-v', 'error', '-select_streams', 'v:0',
+                 '-show_entries', 'format=duration:stream=width,height,pix_fmt,nb_frames,r_frame_rate,duration',
+                 '-of', 'json', path],
+                capture_output=True, text=True, timeout=15
+            )
+            if result.returncode != 0:
+                return None
+            data = json.loads(result.stdout)
+            streams = data.get('streams') or []
+            if not streams:
+                return None
+            s = streams[0]
+            width = int(s['width'])
+            height = int(s['height'])
+            pix_fmt = s.get('pix_fmt', '')
+
+            fps = 25.0
+            rfr = s.get('r_frame_rate', '')
+            if '/' in rfr:
+                num, den = rfr.split('/')
+                num, den = float(num), float(den)
+                if den > 0:
+                    fps = num / den
+
+            total_frames = None
+            nb_frames = s.get('nb_frames')
+            if nb_frames not in (None, 'N/A'):
+                try:
+                    total_frames = int(nb_frames)
+                except ValueError:
+                    total_frames = None
+
+            if not total_frames:
+                # Stream-level duration is often also "N/A" for this kind of
+                # file - the container-level (format) duration is usually
+                # present even then, so try that before giving up.
+                duration = s.get('duration')
+                if duration in (None, 'N/A'):
+                    duration = (data.get('format') or {}).get('duration')
+                if duration not in (None, 'N/A'):
+                    try:
+                        total_frames = max(1, round(float(duration) * fps))
+                    except (TypeError, ValueError):
+                        total_frames = None
+
+            if not total_frames:
+                # Last resort: neither stream nor container duration was
+                # usable. This forces ffprobe to actually decode the whole
+                # file to count frames - slow, but still far better than
+                # silently falling back to the bit-depth-losing cv2 path.
+                total_frames = self._count_frames_via_ffprobe(path)
+                if not total_frames:
+                    return None
+
+            return {'width': width, 'height': height, 'pix_fmt': pix_fmt,
+                     'fps': fps, 'total_frames': total_frames}
+        except (OSError, subprocess.TimeoutExpired, ValueError, KeyError) as e:
+            print(f"ffprobe probe failed, falling back to OpenCV: {e}")
+            return None
+
+    def _count_frames_via_ffprobe(self, path):
+        """Exact but slow frame count - decodes the whole file. Only used
+        when duration-based estimation isn't possible at all."""
+        try:
+            result = subprocess.run(
+                ['ffprobe', '-v', 'error', '-select_streams', 'v:0',
+                 '-count_frames', '-show_entries', 'stream=nb_read_frames',
+                 '-of', 'json', path],
+                capture_output=True, text=True, timeout=120
+            )
+            if result.returncode != 0:
+                return None
+            streams = json.loads(result.stdout).get('streams') or []
+            if not streams:
+                return None
+            n = streams[0].get('nb_read_frames')
+            return int(n) if n not in (None, 'N/A') else None
+        except (OSError, subprocess.TimeoutExpired, ValueError, KeyError):
+            return None
 
     def _load_video(self, path):
         if self._loading_video:
@@ -2400,44 +2653,94 @@ QLabel#fps_display {{
             if self.vidcap:
                 self.vidcap.release()
                 self.vidcap = None
-            
+            if self._raw_reader is not None:
+                self._raw_reader.release()
+                self._raw_reader = None
+
             self.video_path = path
             self._load_dm4_metadata_sidecar(path)
 
-            # Try with different backends
-            backends = [cv2.CAP_ANY, cv2.CAP_FFMPEG]
-            self.vidcap = None
-            
-            for backend in backends:
-                try:
-                    cap = cv2.VideoCapture(path, backend)
-                    if cap.isOpened():
-                        self.vidcap = cap
-                        break
-                except:
-                    continue
-            
-            if self.vidcap is None or not self.vidcap.isOpened():
-                QMessageBox.critical(self, "Error", f"Could not open video:\n{path}")
-                self.video_loaded = False
-                self._loading_video = False
-                self._update_status("FAILED", "#ff5050")
-                return
+            # Probe the actual file for its pixel format - a 16-bit
+            # gray16le source must NOT go through cv2.VideoCapture, which
+            # always decodes to 8-bit BGR and would silently drop the lower
+            # 8 bits of every pixel before any processing even starts.
+            probe = self._probe_video_format(path)
+            use_raw_reader = bool(probe) and probe['pix_fmt'] in ('gray16le', 'gray16be')
 
-            self.source_fps = self.vidcap.get(cv2.CAP_PROP_FPS)
-            self.source_frames = int(self.vidcap.get(cv2.CAP_PROP_FRAME_COUNT))
-            self.width = int(self.vidcap.get(cv2.CAP_PROP_FRAME_WIDTH))
-            self.height = int(self.vidcap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-            
-            if self.source_frames <= 0 or self.width <= 0 or self.height <= 0:
-                QMessageBox.critical(self, "Error", "Invalid video file. Could not read properties.")
-                self.vidcap.release()
+            if use_raw_reader:
+                try:
+                    self._raw_reader = RawFFmpegVideoReader(
+                        path, probe['width'], probe['height'], probe['pix_fmt'],
+                        probe['fps'], probe['total_frames']
+                    )
+                except Exception as e:
+                    print(f"Raw ffmpeg reader failed, falling back to OpenCV: {e}")
+                    use_raw_reader = False
+                    self._raw_reader = None
+
+            if use_raw_reader:
+                self.source_fps = probe['fps']
+                self.source_frames = probe['total_frames']
+                self.width = probe['width']
+                self.height = probe['height']
+                self.bit_depth = 16
+            else:
+                # Try with different backends
+                backends = [cv2.CAP_ANY, cv2.CAP_FFMPEG]
                 self.vidcap = None
-                self.video_loaded = False
-                self._loading_video = False
-                self._update_status("FAILED", "#ff5050")
-                return
-                
+
+                for backend in backends:
+                    try:
+                        cap = cv2.VideoCapture(path, backend)
+                        if cap.isOpened():
+                            self.vidcap = cap
+                            break
+                    except:
+                        continue
+
+                if self.vidcap is None or not self.vidcap.isOpened():
+                    QMessageBox.critical(self, "Error", f"Could not open video:\n{path}")
+                    self.video_loaded = False
+                    self._loading_video = False
+                    self._update_status("FAILED", "#ff5050")
+                    return
+
+                self.source_fps = self.vidcap.get(cv2.CAP_PROP_FPS)
+                self.source_frames = int(self.vidcap.get(cv2.CAP_PROP_FRAME_COUNT))
+                self.width = int(self.vidcap.get(cv2.CAP_PROP_FRAME_WIDTH))
+                self.height = int(self.vidcap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                self.bit_depth = 8
+
+                if self.source_frames <= 0 or self.width <= 0 or self.height <= 0:
+                    QMessageBox.critical(self, "Error", "Invalid video file. Could not read properties.")
+                    self.vidcap.release()
+                    self.vidcap = None
+                    self.video_loaded = False
+                    self._loading_video = False
+                    self._update_status("FAILED", "#ff5050")
+                    return
+
+            self.max_val = 65535 if self.bit_depth == 16 else 255
+            self.processor.max_val = self.max_val
+            self.roi_tracker.max_val = self.max_val
+            # The autocontrast/gamma LUTs are sized off the previous video's
+            # max_val - without forcing a rebuild here, switching from an
+            # 8-bit to a 16-bit source (or back) would index a 256-entry LUT
+            # with values up to 65535 on the very next frame (IndexError).
+            self.processor.autocontrast_built = False
+            self.processor.gamma_lut = None
+            self.bitdepth_label.setText("16-BIT NATIVE" if self.bit_depth == 16 else "8-BIT")
+            # A 16-bit source defaults to lossless export (round-tripping it
+            # through the lossy path would truncate it); an 8-bit source
+            # keeps the historical default of lossy export.
+            self.export_mode_combo.setCurrentIndex(1 if self.bit_depth == 16 else 0)
+            # cv2.medianBlur only supports ksize 3 or 5 for 16-bit images.
+            self.mk_spin.setToolTip(
+                "Median kernel size. NOTE: 16-bit sources only support 3 or 5 "
+                "(OpenCV limitation) - larger values are clamped to 5."
+                if self.bit_depth == 16 else ""
+            )
+
             self.fps = int(self.source_fps) if self.source_fps > 0 else 25
             self.video_loaded = True
             self._video_error = False
@@ -2476,6 +2779,9 @@ QLabel#fps_display {{
             QMessageBox.critical(self, "Error", f"Error loading video:\n{str(e)}")
             self.video_loaded = False
             self.vidcap = None
+            if self._raw_reader is not None:
+                self._raw_reader.release()
+                self._raw_reader = None
             self._loading_video = False
             self._update_status("ERROR", "#ff5050")
 
@@ -2488,7 +2794,8 @@ QLabel#fps_display {{
         paused, so edits are reflected immediately instead of being
         swallowed by the "already on this frame" short-circuit below.
         """
-        if not self.video_loaded or self.vidcap is None or not self.vidcap.isOpened():
+        has_decoder = (self.vidcap is not None and self.vidcap.isOpened()) or self._raw_reader is not None
+        if not self.video_loaded or not has_decoder:
             return False
 
         try:
@@ -2506,6 +2813,21 @@ QLabel#fps_display {{
                 with self._frame_lock:
                     image = self._raw_gray_frame
                 sequential = False
+            elif self._raw_reader is not None:
+                # 16-bit lossless source: frames come pre-grayscaled and at
+                # native dtype straight from the ffmpeg pipe - no BGR2GRAY
+                # step (and no implicit 8-bit cast) needed or wanted here.
+                sequential = (frame_num == self.current_frame + 1)
+                self.current_frame = frame_num
+
+                image = self._raw_reader.read_frame(frame_num)
+                self._last_read_ok = image is not None
+                if image is None:
+                    print(f"Failed to read frame {frame_num} from raw reader")
+                    return False
+
+                with self._frame_lock:
+                    self._raw_gray_frame = image
             else:
                 # Sequential playback can just read the next frame off the decoder -
                 # seeking (CAP_PROP_POS_FRAMES) forces a decode from the nearest
@@ -2542,6 +2864,10 @@ QLabel#fps_display {{
                     print(f"Failed to read frame {frame_num} after 3 attempts")
                     return False
 
+                # NOTE: this is an 8-bit-only path - cv2.VideoCapture always
+                # decodes to 8-bit BGR regardless of the source's real depth,
+                # which is exactly why a 16-bit source is routed through
+                # self._raw_reader above instead of ever reaching this branch.
                 image = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
                 with self._frame_lock:
                     self._raw_gray_frame = image
@@ -2704,15 +3030,20 @@ QLabel#fps_display {{
                 processed = self.processor.apply_drift_correction(processed, dx, dy)
         
         if self.ff_cb.isChecked() and self.D is not None and self.D.shape == processed.shape:
-            if self.processor.ff_buffer is None or self.processor.ff_buffer.shape != processed.shape:
+            # Output buffer dtype must track the source's native depth - this
+            # used to hardcode uint8, which would silently truncate a 16-bit
+            # frame right here regardless of self.max_val below.
+            out_dtype = processed.dtype
+            if (self.processor.ff_buffer is None or self.processor.ff_buffer.shape != processed.shape
+                    or self.processor.ff_output.dtype != out_dtype):
                 self.processor.ff_buffer = np.empty(processed.shape, dtype=np.float32)
-                self.processor.ff_output = np.empty(processed.shape, dtype=np.uint8)
+                self.processor.ff_output = np.empty(processed.shape, dtype=out_dtype)
             self.processor.ff_buffer[:] = processed
             np.subtract(self.processor.ff_buffer, self.D, out=self.processor.ff_buffer)
             np.multiply(self.processor.ff_buffer, self.G, out=self.processor.ff_buffer)
-            np.clip(self.processor.ff_buffer, 0, 255, out=self.processor.ff_buffer)
+            np.clip(self.processor.ff_buffer, 0, self.max_val, out=self.processor.ff_buffer)
             np.round(self.processor.ff_buffer, out=self.processor.ff_buffer)
-            self.processor.ff_output[:] = self.processor.ff_buffer.astype(np.uint8, copy=False)
+            self.processor.ff_output[:] = self.processor.ff_buffer.astype(out_dtype, copy=False)
             processed = self.processor.ff_output
         
         contrast_method = settings.get('contrast_method', 0)
@@ -2743,12 +3074,26 @@ QLabel#fps_display {{
         elif filter_mode == 2:
             k = settings.get('median_kernel', 3)
             if k % 2 == 0: k += 1
+            if processed.dtype == np.uint16 and k not in (3, 5):
+                # cv2.medianBlur only supports ksize 3 or 5 for 16-bit
+                # images (larger kernels are 8-bit/float32 only) - clamp
+                # instead of letting cv2 raise, and flag it via print since
+                # this silently changes the requested kernel size.
+                print(f"Median kernel {k} unsupported at 16-bit, using 5 instead")
+                k = 5
             processed = cv2.medianBlur(processed, k)
         elif filter_mode == 3:
             d = settings.get('bilateral_d', 9)
             sc = settings.get('bilateral_sigmaColor', 75)
             ss = settings.get('bilateral_sigmaSpace', 75)
-            processed = cv2.bilateralFilter(processed, d, sc, ss)
+            if processed.dtype == np.uint16:
+                # cv2.bilateralFilter only accepts 8-bit or 32-bit float
+                # images - round-trip through float32 instead of silently
+                # truncating to 8-bit, so full 16-bit dynamic range survives.
+                filtered = cv2.bilateralFilter(processed.astype(np.float32), d, sc, ss)
+                processed = np.clip(np.round(filtered), 0, self.max_val).astype(np.uint16)
+            else:
+                processed = cv2.bilateralFilter(processed, d, sc, ss)
         
         return processed
 
@@ -2829,7 +3174,15 @@ QLabel#fps_display {{
             image = self._current_frame
             if image is None:
                 return
-        
+
+        if image.dtype == np.uint16:
+            # Preview only: QImage/QPixmap below are built as 8-bit RGB888,
+            # so downcast to the top 8 bits just for on-screen display. This
+            # reassigns the local `image` variable to a new array and never
+            # touches self._current_frame, so screenshots/export (which read
+            # self._current_frame independently) still see full 16-bit data.
+            image = (image >> 8).astype(np.uint8)
+
         if len(image.shape) == 2:
             rgb = cv2.cvtColor(image, cv2.COLOR_GRAY2RGB)
         else:
@@ -3072,13 +3425,15 @@ QLabel#fps_display {{
 
     def _play(self):
         """Start playback."""
-        if not self.video_loaded or self.vidcap is None or self._loading_video:
+        if not self.video_loaded or self._loading_video:
+            return
+        if self.vidcap is None and self._raw_reader is None:
             return
         if self._exporting:
-            # Export reads self.vidcap sequentially in its own loop; letting
-            # playback restart here (e.g. via the Space shortcut, which
-            # doesn't go through play_btn's disabled state) would race both
-            # loops against the same VideoCapture object.
+            # Export reads the shared decoder (self.vidcap or self._raw_reader)
+            # sequentially in its own loop; letting playback restart here
+            # (e.g. via the Space shortcut, which doesn't go through
+            # play_btn's disabled state) would race both loops against it.
             return
         
         if self.current_frame >= self.source_frames - 1:
@@ -3184,34 +3539,73 @@ QLabel#fps_display {{
         self.timeline.setEnabled(enabled)
 
     def _export_range(self, start, end, name):
+        lossless_export = self.export_mode_combo.currentIndex() == 1
+        source_is_16bit = self.bit_depth == 16
+
+        if source_is_16bit and not lossless_export:
+            # Flag: LOSSY H.265 always writes 8-bit gray/yuv420p, so exporting
+            # a 16-bit source through it discards the lower 8 bits of every
+            # pixel. That's a legitimate choice (smaller files) but must not
+            # happen silently.
+            reply = QMessageBox.question(
+                self, "Bit-depth truncation",
+                "Source is 16-bit, but LOSSY H.265 export always writes 8-bit "
+                "output - the lower 8 bits of every pixel will be discarded.\n\n"
+                "Continue anyway?",
+                QMessageBox.Yes | QMessageBox.No
+            )
+            if reply != QMessageBox.Yes:
+                return
+
+        default_name = f"{name}_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.mkv"
         path, _ = QFileDialog.getSaveFileName(
-            self, "Export Video",
-            f"{name}_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.mkv",
-            "Video Files (*.mkv *.mp4 *.avi)"
+            self, "Export Video", default_name, "Video Files (*.mkv *.mp4 *.avi)"
         )
         if not path:
             return
-        
+
+        if lossless_export and os.path.splitext(path)[1].lower() == ".mp4":
+            # FFV1/gray16le isn't reliably supported by the MP4 muxer.
+            path = os.path.splitext(path)[0] + ".mkv"
+
         total = end - start + 1
         progress = QProgressDialog("Exporting video...", "Cancel", 0, total, self)
         progress.setWindowModality(Qt.WindowModal)
         progress.show()
-        
-        cmd = [
-            'ffmpeg', '-y',
-            '-f', 'rawvideo',
-            '-vcodec', 'rawvideo',
-            '-s', f'{self.width}x{self.height}',
-            '-pix_fmt', 'gray',
-            '-r', str(self.fps),
-            '-i', '-',
-            '-c:v', 'libx265',
-            '-crf', '22',
-            '-preset', 'medium',
-            '-pix_fmt', 'yuv420p',
-            path
-        ]
-        
+
+        if lossless_export:
+            out_pix_fmt = 'gray16le' if source_is_16bit else 'gray'
+            cmd = [
+                'ffmpeg', '-y',
+                '-f', 'rawvideo',
+                '-vcodec', 'rawvideo',
+                '-s', f'{self.width}x{self.height}',
+                '-pix_fmt', out_pix_fmt,
+                '-r', str(self.fps),
+                '-i', '-',
+                '-c:v', 'ffv1',
+                '-level', '3',
+                '-g', '1',
+                '-slicecrc', '1',
+                '-pix_fmt', out_pix_fmt,
+                path
+            ]
+        else:
+            cmd = [
+                'ffmpeg', '-y',
+                '-f', 'rawvideo',
+                '-vcodec', 'rawvideo',
+                '-s', f'{self.width}x{self.height}',
+                '-pix_fmt', 'gray',
+                '-r', str(self.fps),
+                '-i', '-',
+                '-c:v', 'libx265',
+                '-crf', '22',
+                '-preset', 'medium',
+                '-pix_fmt', 'yuv420p',
+                path
+            ]
+
         proc = subprocess.Popen(
             cmd,
             stdin=subprocess.PIPE,
@@ -3231,25 +3625,43 @@ QLabel#fps_display {{
             self.roi_tracker.last_dx = 0.0
             self.roi_tracker.last_dy = 0.0
 
+        # For a 16-bit source, export reads through its own RawFFmpegVideoReader
+        # rather than the shared self._raw_reader, so this loop's seeking
+        # never disturbs the live preview's sequential-read bookkeeping (the
+        # two are also never expected to run concurrently - see _play's
+        # self._exporting guard).
+        export_reader = None
+        if self._raw_reader is not None:
+            export_reader = RawFFmpegVideoReader(
+                self.video_path, self.width, self.height, self._raw_reader.pix_fmt,
+                self.source_fps, self.source_frames
+            )
+
         try:
             for i, frame_num in enumerate(range(start, end + 1)):
                 if progress.wasCanceled():
                     break
 
-                if self.vidcap is None:
-                    break
+                if export_reader is not None:
+                    image = export_reader.read_frame(frame_num)
+                    if image is None:
+                        continue
+                else:
+                    if self.vidcap is None:
+                        break
 
-                if i == 0:
-                    # Only the first frame needs an explicit seek - the loop
-                    # then reads sequentially, which is far faster than
-                    # seeking (CAP_PROP_POS_FRAMES) on every single frame.
-                    self.vidcap.set(cv2.CAP_PROP_POS_FRAMES, frame_num)
-                ret, frame = self.vidcap.read()
+                    if i == 0:
+                        # Only the first frame needs an explicit seek - the loop
+                        # then reads sequentially, which is far faster than
+                        # seeking (CAP_PROP_POS_FRAMES) on every single frame.
+                        self.vidcap.set(cv2.CAP_PROP_POS_FRAMES, frame_num)
+                    ret, frame = self.vidcap.read()
 
-                if not ret:
-                    continue
+                    if not ret:
+                        continue
 
-                image = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                    image = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
                 settings = self._get_settings_for_frame(frame_num)
 
                 if drift_active:
@@ -3260,18 +3672,28 @@ QLabel#fps_display {{
 
                 processed = self._process_frame(image, settings)
 
-                proc.stdin.write(processed.tobytes())
+                if not lossless_export and processed.dtype == np.uint16:
+                    # Confirmed truncation path (user already agreed above):
+                    # keep only the top 8 bits for the 8-bit lossy encoder.
+                    out_frame = (processed >> 8).astype(np.uint8)
+                else:
+                    out_frame = processed
+
+                proc.stdin.write(out_frame.tobytes())
                 progress.setValue(i + 1)
                 QApplication.processEvents()
-            
+
             proc.stdin.close()
             proc.wait(timeout=300)
-            
+
         except Exception as e:
             print(f"Export error: {e}")
             proc.kill()
+        finally:
+            if export_reader is not None:
+                export_reader.release()
 
-        # Exporting reads the shared vidcap independently of _go_to_frame's
+        # Exporting reads its own decoder independently of _go_to_frame's
         # sequential-read bookkeeping, so force the next preview navigation
         # to reseek rather than trusting a stale decoder position.
         self._last_read_ok = False
@@ -3280,7 +3702,7 @@ QLabel#fps_display {{
 
         if os.path.exists(path):
             size = os.path.getsize(path) / (1024 * 1024)
-            QMessageBox.information(self, "Export Complete", 
+            QMessageBox.information(self, "Export Complete",
                 f"Video exported successfully!\n\n{os.path.basename(path)}\n{size:.1f} MB")
 
     def _export_segments(self):
@@ -3341,10 +3763,15 @@ QLabel#fps_display {{
                 return
         
         try:
-            hist = np.histogram(img.flatten(), bins=256, range=(0, 255))[0]
+            # Always binned into 256 buckets regardless of source depth, but
+            # the bucket edges must span the frame's actual native range -
+            # this used to hardcode (0, 255), which for a 16-bit frame would
+            # cram its whole 0-65535 range into the single first bucket.
+            max_val = getattr(self, 'max_val', 255)
+            hist = np.histogram(img.flatten(), bins=256, range=(0, max_val))[0]
             self.hist_ax.clear()
             self.hist_ax.bar(range(256), hist, color='#5b86ad', alpha=0.85, width=1.0)
-            self.hist_ax.set_xlabel("Intensity", color='#8a8b90')
+            self.hist_ax.set_xlabel("Intensity (binned)", color='#8a8b90')
             self.hist_ax.set_ylabel("Frequency", color='#8a8b90')
             self.hist_ax.grid(True, alpha=0.15, color='#3a3b40')
             self.hist_ax.set_facecolor('#1a1b1e')
@@ -3353,7 +3780,9 @@ QLabel#fps_display {{
 
             mean_val = np.mean(img)
             std_val = np.std(img)
-            self.hist_ax.set_title(f"MEAN: {mean_val:.1f}  STD: {std_val:.1f}", color='#cfd0d4')
+            self.hist_ax.set_title(
+                f"MEAN: {mean_val:.1f}  STD: {std_val:.1f}  (0-{max_val})", color='#cfd0d4'
+            )
             
             self.hist_canvas.draw()
         except Exception as e:
@@ -3429,6 +3858,8 @@ QLabel#fps_display {{
 
         if self.vidcap is not None:
             self.vidcap.release()
+        if self._raw_reader is not None:
+            self._raw_reader.release()
 
         print(f"\n{'=' * 60}\nFINAL REPORT\n{'=' * 60}")
         if self.video_path:

@@ -36,6 +36,12 @@ fichiers DM3/DM4) en vidéo.
   (format `rawvideo`), sans fichiers intermédiaires
 - Conversion en arrière-plan dans un thread dédié (`ConversionWorker`)
 - Fenêtre de sélection de dossier et de lancement (`DM4ConverterDialog`)
+- Deux modes de qualité au choix : **avec perte** (H.264 8-bit, fichiers
+  légers) ou **sans perte** (FFV1, à la profondeur de bits native de la
+  source — 8 ou 16 bits selon les frames DM3/DM4). Le mode sans perte
+  produit un `.mkv` (le conteneur MP4 ne supportant pas correctement le
+  16-bit/FFV1) et un message avertit si le mode avec perte est choisi sur
+  une source 16-bit, puisque cela tronque alors la profondeur de bits.
 
 ### `tem_video_processor.py`
 Éditeur de post-traitement pour les vidéos issues de `dm4_converter.py`
@@ -43,10 +49,20 @@ fichiers DM3/DM4) en vidéo.
 
 - Mêmes algorithmes de traitement que `tem_main.py` (dérive, autocontraste,
   gamma), avec le CLAHE intégré directement dans `TEMProcessor`
+- Détection automatique de la profondeur de bits de la vidéo ouverte
+  (`ffprobe`) : une source 8-bit passe par OpenCV comme avant, une source
+  16-bit (`gray16le`) est lue via un pipe FFmpeg dédié
+  (`RawFFmpegVideoReader`) plutôt que `cv2.VideoCapture`, qui décode
+  toujours en 8-bit BGR et aurait sinon tronqué silencieusement la
+  précision. Tout le pipeline (dérive, contraste, gamma, filtres) travaille
+  ensuite à la profondeur native de la source
 - Segmentation de la vidéo en plages à traitement indépendant
   (`ProcessingSegment`)
 - Ligne de temps interactive (`TimelineWidget`)
 - Fenêtre principale d'édition et d'export (`TEMVideoProcessor`)
+- Export au choix : H.265 avec perte (8-bit) ou FFV1 sans perte (profondeur
+  native de la vidéo ouverte), avec confirmation demandée si un export
+  8-bit est lancé sur une source 16-bit
 - Importe `DM4ConverterDialog` depuis `dm4_converter.py` : les deux fichiers
   doivent rester dans le même dossier
 
@@ -61,8 +77,11 @@ Deux dépendances supplémentaires ne sont pas installables via pip :
 - **SDK Ximea (`xiapi`)** : requis uniquement par `tem_main.py`, fourni par
   Ximea avec les pilotes de la caméra Megaview. Nécessite la caméra
   physique connectée.
-- **FFmpeg** : requis par les trois scripts pour l'encodage/décodage vidéo.
-  Doit être installé séparément et accessible dans le PATH.
+- **FFmpeg** (avec **ffprobe**) : requis par les trois scripts pour
+  l'encodage/décodage vidéo. `tem_video_processor.py` utilise `ffprobe`
+  pour détecter la profondeur de bits d'une vidéo à l'ouverture ; les deux
+  doivent être installés et accessibles dans le PATH (ils sont fournis
+  ensemble dans une installation FFmpeg standard).
 
 `tem_main.py` nécessite en outre la caméra Ximea Megaview branchée pour
 fonctionner ; `dm4_converter.py` et `tem_video_processor.py` n'ont pas cette

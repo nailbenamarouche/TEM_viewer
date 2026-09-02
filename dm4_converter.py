@@ -360,9 +360,10 @@ class ConversionWorker(QThread):
     progress = pyqtSignal(int, int, float)   # current, total, encode fps
     finished_ok = pyqtSignal(str)            # output path
     failed = pyqtSignal(str)                 # error message
+    warning = pyqtSignal(str)                # non-fatal heads-up (e.g. bit-depth truncation)
 
     def __init__(self, input_dir, output_path, pattern, source_fps, target_fps,
-                 preset, crf, scale_width, interp_mode, parent=None):
+                 preset, crf, scale_width, interp_mode, lossless=False, parent=None):
         super().__init__(parent)
         self.input_dir = input_dir
         self.output_path = output_path
@@ -373,6 +374,7 @@ class ConversionWorker(QThread):
         self.crf = crf
         self.scale_width = scale_width
         self.interp_mode = interp_mode
+        self.lossless = lossless
         self._abort = False
 
     def abort(self):
@@ -393,8 +395,10 @@ class ConversionWorker(QThread):
             return
 
         # ---- Metadata: pixel calibration + instrument info, best-effort ----
+        # Saved once encoding parameters are known below, so the sidecar also
+        # records the bit depth/codec actually used - the processor reads
+        # this back to decide how to open the file.
         metadata = extract_dm4_metadata(files[0])
-        save_metadata_sidecar(self.output_path, metadata)
 
         # ---- Inspect the first frame to fix resolution / dtype ----
         first = dm.dmReader(files[0])['data']
@@ -426,6 +430,16 @@ class ConversionWorker(QThread):
 
         pix_fmt = "gray" if dtype == np.uint8 else "gray16le"
 
+        if not self.lossless and pix_fmt != "gray":
+            # Flag: the lossy path always forces 8-bit yuv420p below, so a
+            # 16-bit source's extra precision is thrown away right here -
+            # this is the truncation the caller should be warned about.
+            self.warning.emit(
+                f"Source frames are {pix_fmt} (16-bit), but Lossy mode encodes "
+                "to 8-bit H.264 - this truncates bit depth. Use Lossless FFV1 "
+                "to keep the full precision."
+            )
+
         vf_parts = []
         if self.scale_width > 0:
             vf_parts.append(f"scale={self.scale_width}:-1:flags=lanczos")
@@ -435,7 +449,11 @@ class ConversionWorker(QThread):
             )
         else:
             vf_parts.append(f"minterpolate=fps={self.target_fps}:mi_mode=blend")
-        vf_parts.append("format=yuv420p")
+        if not self.lossless:
+            # Truncation point: forces 8-bit chroma-subsampled yuv420p even
+            # when pix_fmt above is gray16le, i.e. this is where a 16-bit
+            # source silently loses its lower 8 bits in the lossy path.
+            vf_parts.append("format=yuv420p")
         vf_string = ",".join(vf_parts)
 
         out_dir = os.path.dirname(self.output_path)
@@ -443,23 +461,54 @@ class ConversionWorker(QThread):
             os.makedirs(out_dir)
         log_path = os.path.join(out_dir or ".", "ffmpeg.log")
 
-        cmd = [
-            "ffmpeg", "-y",
-            "-f", "rawvideo",
-            "-pixel_format", pix_fmt,
-            "-video_size", f"{width}x{height}",
-            "-framerate", str(self.source_fps),
-            "-i", "-",
-            "-vf", vf_string,
-            "-c:v", "libx264",
-            "-preset", self.preset,
-            "-crf", str(self.crf),
-            "-pix_fmt", "yuv420p",
-            "-movflags", "+faststart",
-            "-r", str(self.target_fps),
-            "-threads", "0",
-            self.output_path,
-        ]
+        if self.lossless:
+            # FFV1: lossless, intra-only (every frame is a keyframe, so the
+            # processor can seek to any frame cheaply and exactly), and
+            # encodes gray/gray16le directly - no forced 8-bit conversion.
+            codec = "ffv1"
+            cmd = [
+                "ffmpeg", "-y",
+                "-f", "rawvideo",
+                "-pixel_format", pix_fmt,
+                "-video_size", f"{width}x{height}",
+                "-framerate", str(self.source_fps),
+                "-i", "-",
+                "-vf", vf_string,
+                "-c:v", "ffv1",
+                "-level", "3",
+                "-g", "1",
+                "-slicecrc", "1",
+                "-pix_fmt", pix_fmt,
+                "-r", str(self.target_fps),
+                "-threads", "0",
+                self.output_path,
+            ]
+        else:
+            codec = "libx264"
+            cmd = [
+                "ffmpeg", "-y",
+                "-f", "rawvideo",
+                "-pixel_format", pix_fmt,
+                "-video_size", f"{width}x{height}",
+                "-framerate", str(self.source_fps),
+                "-i", "-",
+                "-vf", vf_string,
+                "-c:v", "libx264",
+                "-preset", self.preset,
+                "-crf", str(self.crf),
+                "-pix_fmt", "yuv420p",
+                "-movflags", "+faststart",
+                "-r", str(self.target_fps),
+                "-threads", "0",
+                self.output_path,
+            ]
+
+        if metadata is not None:
+            metadata['video_mode'] = "lossless" if self.lossless else "lossy"
+            metadata['video_pixel_format'] = pix_fmt
+            metadata['video_codec'] = codec
+            metadata['video_bit_depth'] = 8 if pix_fmt == "gray" else 16
+        save_metadata_sidecar(self.output_path, metadata)
 
         try:
             log_file = open(log_path, "wb")
@@ -603,6 +652,21 @@ class DM4ConverterDialog(QDialog):
         enc_form.setVerticalSpacing(10)
         enc_form.setHorizontalSpacing(12)
 
+        self.quality_combo = QComboBox()
+        self.quality_combo.addItems([
+            "Lossy H.264 (8-bit, smaller files)",
+            "Lossless FFV1 (native bit depth)",
+        ])
+        self.quality_combo.setToolTip(
+            "Lossy: always encodes to 8-bit yuv420p via H.264 - if the source\n"
+            "DM3/DM4 frames are 16-bit, this truncates them to 8 bits.\n"
+            "Lossless: encodes with FFV1 at the source's native bit depth\n"
+            "(8-bit gray or 16-bit gray16le), so nothing is thrown away. Files\n"
+            "are much larger and are written as .mkv (not .mp4)."
+        )
+        self.quality_combo.currentIndexChanged.connect(self._on_quality_changed)
+        enc_form.addRow("Quality:", self.quality_combo)
+
         self.source_fps_spin = QSpinBox()
         self.source_fps_spin.setRange(1, 240)
         self.source_fps_spin.setValue(25)
@@ -667,7 +731,8 @@ class DM4ConverterDialog(QDialog):
         if path:
             self.input_edit.setText(path)
             if not self.output_edit.text():
-                self.output_edit.setText(os.path.join(path, "video.mp4"))
+                ext = ".mkv" if self.quality_combo.currentIndex() == 1 else ".mp4"
+                self.output_edit.setText(os.path.join(path, "video" + ext))
             self._scan_input_folder(path)
 
     def _rescan_current_input(self):
@@ -698,8 +763,26 @@ class DM4ConverterDialog(QDialog):
                 f"matching '{pattern}'."
             )
 
+    def _on_quality_changed(self, index):
+        """index 1 = lossless FFV1. Presets/CRF are x264-only, so grey them
+        out; and since FFV1 (and 16-bit gray16le) isn't reliably supported by
+        the MP4 muxer, switch the suggested output extension to .mkv."""
+        lossless = index == 1
+        self.preset_combo.setEnabled(not lossless)
+        self.crf_spin.setEnabled(not lossless)
+
+        current = self.output_edit.text().strip()
+        if current:
+            root, ext = os.path.splitext(current)
+            if lossless and ext.lower() == ".mp4":
+                self.output_edit.setText(root + ".mkv")
+            elif not lossless and ext.lower() == ".mkv":
+                self.output_edit.setText(root + ".mp4")
+
     def _browse_output(self):
-        path, _ = QFileDialog.getSaveFileName(self, "Save video as", "", "MP4 Video (*.mp4)")
+        lossless = self.quality_combo.currentIndex() == 1
+        filter_str = "MKV Video (*.mkv)" if lossless else "MP4 Video (*.mp4)"
+        path, _ = QFileDialog.getSaveFileName(self, "Save video as", "", filter_str)
         if path:
             self.output_edit.setText(path)
 
@@ -722,6 +805,15 @@ class DM4ConverterDialog(QDialog):
             QMessageBox.warning(self, "Invalid output", "Please choose an output video path.")
             return
 
+        lossless = self.quality_combo.currentIndex() == 1
+        if lossless and os.path.splitext(output_path)[1].lower() == ".mp4":
+            # FFV1/gray16le isn't reliably supported by the MP4 muxer -
+            # catches the case where the user typed the path by hand instead
+            # of using Browse (which keeps the extension in sync).
+            root, _ = os.path.splitext(output_path)
+            output_path = root + ".mkv"
+            self.output_edit.setText(output_path)
+
         self.convert_btn.setEnabled(False)
         self.cancel_btn.setEnabled(True)
         self.skip_btn.setEnabled(False)
@@ -737,10 +829,12 @@ class DM4ConverterDialog(QDialog):
             crf=self.crf_spin.value(),
             scale_width=self.scale_spin.value(),
             interp_mode="mci" if self.interp_combo.currentIndex() == 1 else "blend",
+            lossless=self.quality_combo.currentIndex() == 1,
         )
         self.worker.progress.connect(self._on_progress)
         self.worker.finished_ok.connect(self._on_finished)
         self.worker.failed.connect(self._on_failed)
+        self.worker.warning.connect(self._on_warning)
         self.worker.start()
 
     def _cancel_conversion(self):
@@ -763,6 +857,9 @@ class DM4ConverterDialog(QDialog):
         QMessageBox.information(self, "Conversion complete", f"Video created:\n{output_path}")
         self.video_ready.emit(output_path)
         self.accept()
+
+    def _on_warning(self, message):
+        QMessageBox.warning(self, "Bit-depth warning", message)
 
     def _on_failed(self, message):
         self.status_label.setText("Failed.")

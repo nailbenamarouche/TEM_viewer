@@ -3744,8 +3744,9 @@ QLabel#fps_display {{
             self.hist_ax.set_facecolor('#1a1b1e')
             self.hist_ax.tick_params(colors='#8a8b90')
 
+            placeholder_max = getattr(self, 'max_val', 255)
             self.hist_ax.bar(range(256), [0]*256, color='#5b86ad', alpha=0.85, width=1.0)
-            self.hist_ax.set_xlim(0, 255)
+            self.hist_ax.set_xlim(0, placeholder_max)
             
             self.hist_canvas = FigureCanvas(self.hist_figure)
             self.histogram_window.setCentralWidget(self.hist_canvas)
@@ -3768,15 +3769,22 @@ QLabel#fps_display {{
             # this used to hardcode (0, 255), which for a 16-bit frame would
             # cram its whole 0-65535 range into the single first bucket.
             max_val = getattr(self, 'max_val', 255)
-            hist = np.histogram(img.flatten(), bins=256, range=(0, max_val))[0]
+            hist, edges = np.histogram(img.flatten(), bins=256, range=(0, max_val))
             self.hist_ax.clear()
-            self.hist_ax.bar(range(256), hist, color='#5b86ad', alpha=0.85, width=1.0)
-            self.hist_ax.set_xlabel("Intensity (binned)", color='#8a8b90')
+            # Plot bars at their actual intensity value (bin edges), not at
+            # the bin's plain index 0-255 - that was the actual bug: the
+            # histogram data itself already spanned 0-max_val correctly, but
+            # plotting against bin index and hardcoding xlim to (0, 255)
+            # made a 16-bit histogram *look* clamped to 0-255 on screen.
+            bin_width = edges[1] - edges[0]
+            self.hist_ax.bar(edges[:-1], hist, width=bin_width, align='edge',
+                              color='#5b86ad', alpha=0.85)
+            self.hist_ax.set_xlabel("Intensity", color='#8a8b90')
             self.hist_ax.set_ylabel("Frequency", color='#8a8b90')
             self.hist_ax.grid(True, alpha=0.15, color='#3a3b40')
             self.hist_ax.set_facecolor('#1a1b1e')
             self.hist_ax.tick_params(colors='#8a8b90')
-            self.hist_ax.set_xlim(0, 255)
+            self.hist_ax.set_xlim(0, max_val)
 
             mean_val = np.mean(img)
             std_val = np.std(img)

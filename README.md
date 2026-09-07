@@ -48,7 +48,8 @@ fichiers DM3/DM4) en vidéo.
 (ou toute autre vidéo).
 
 - Mêmes algorithmes de traitement que `tem_main.py` (dérive, autocontraste,
-  gamma), avec le CLAHE intégré directement dans `TEMProcessor`
+  gamma), avec le CLAHE intégré directement dans `TEMProcessor` ; une option
+  « aucun contraste » (passage sans modification) est aussi disponible
 - Détection automatique de la profondeur de bits de la vidéo ouverte
   (`ffprobe`) : une source 8-bit passe par OpenCV comme avant, une source
   16-bit (`gray16le`) est lue via un pipe FFmpeg dédié
@@ -94,8 +95,10 @@ dépendances Python et de FFmpeg.
 # Acquisition temps réel (nécessite la caméra Ximea Megaview)
 python tem_main.py
 
-# Conversion DM3/DM4 -> vidéo, puis édition
-python dm4_converter.py
+# Conversion DM3/DM4 -> vidéo, puis édition (dm4_converter.py n'a pas de
+# point d'entrée propre - sa boîte de dialogue de conversion est affichée
+# automatiquement par tem_video_processor.py au démarrage)
+python tem_video_processor.py
 ```
 
 ## Contexte

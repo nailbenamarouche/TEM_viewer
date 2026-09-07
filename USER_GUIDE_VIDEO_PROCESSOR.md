@@ -48,22 +48,25 @@ not while scrubbing the timeline — see [Drift correction](#5-drift-correction)
 
 ## 4. Image processing
 
-- **GAMMA**: slider + exact-value spin box (default 0.65).
+- **GAMMA**: slider + exact-value spin box (default 1.00, i.e. no
+  adjustment).
 - **CONTRAST**: **AUTOCONTRAST** (default) with adjustable LOW%/HIGH%
-  percentile clipping (default 1.0/99.0), or **CLAHE** with adjustable
-  CLIP limit and TILE size (default 2.0/8) — both more tunable here than
-  in the live viewer.
+  percentile clipping (default 1.0/99.0), **CLAHE** with adjustable CLIP
+  limit and TILE size (default 2.0/8) — both more tunable here than in the
+  live viewer — or **NONE**, which passes the frame through with no
+  contrast processing at all (useful for keeping raw intensities
+  meaningful, e.g. diffraction patterns). Note that NONE only skips this
+  step - GAMMA is still applied on top of it, so leave GAMMA at 1.00 too if
+  you want a truly untouched frame.
 - **FILTER**: NONE / GAUSSIAN / MEDIAN / BILATERAL / NLM, each with its own
-  parameters (kernel size, sigma, etc.).
+  parameters (kernel size, sigma, etc.). NLM is a fast bilateral-filter
+  approximation on both CPU and GPU (label-independent here), not true
+  Non-Local Means (too slow for practical use on CPU).
 - **FLAT FIELD CORRECTION**: click **LOAD FLAT FIELD** to browse for a dark
   reference image, then a gain/reference image. Unlike the live viewer,
   there's no fixed file path — you pick the images yourself, and they're
   automatically resized to match the loaded video's resolution if they
   don't already.
-- **NLM/BILATERAL DENOISING** checkbox (label depends on whether a CUDA GPU
-  is detected): an extra denoise pass before the FILTER above. Like the
-  live viewer, this is a fast bilateral-filter approximation on both CPU
-  and GPU, not true Non-Local Means (too slow for practical use on CPU).
 
 ## 5. Drift correction
 
@@ -99,9 +102,8 @@ and wonder why nothing changed because this box is still unchecked.
   named segment (`SEG 1`, `SEG 2`, ...). This is how different parts of the
   same video can get different treatment — e.g. one segment autocontrast,
   another CLAHE with heavier denoising.
-  - Note: the edge-strip MARGIN/WIDTH values and the NLM/Bilateral
-    denoising checkbox are *not* saved per-segment (they're a single global
-    setting), only what's listed above is.
+  - Note: the edge-strip MARGIN/WIDTH values are *not* saved per-segment
+    (they're a single global setting), only what's listed above is.
 - Clicking a segment in the list reloads its settings and jumps the
   timeline/selection to match it — useful for reviewing or tweaking it
   before re-exporting. **DELETE** removes the selected segment, **CLEAR
@@ -131,9 +133,9 @@ have this, and the checkbox stays disabled.
   histogram of the current frame (mean/std in the title).
 - **SCREENSHOT** (button or `C`): saves the current frame as a PNG.
 - **RESET SETTINGS**: restores gamma, contrast method and its parameters,
-  filter and its parameters, flat-field, denoising, and drift correction
-  (including turning APPLY DRIFT CORRECTION back off) to their defaults.
-  Does not touch the loaded video, segments, or theme.
+  filter and its parameters, flat-field, and drift correction (including
+  turning APPLY DRIFT CORRECTION back off) to their defaults. Does not
+  touch the loaded video, segments, or theme.
 - **THEME**: DARK / LIGHT.
 - **FULLSCREEN** (checkbox or `F11`, `Esc` to exit).
 

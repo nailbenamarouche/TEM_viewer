@@ -1712,7 +1712,7 @@ class TEMVideoProcessor(QMainWindow):
         self.enable_screenshot = False
         self.drift_interval = 1
         self._prev_drift_choice = 0
-        self.gamma_value = 0.65
+        self.gamma_value = 1.0
 
         # Counters
         self.frames_read = 0
@@ -2073,14 +2073,14 @@ class TEMVideoProcessor(QMainWindow):
         gamma_row.addWidget(QLabel("GAMMA"))
         self.gamma_slider = QSlider(Qt.Horizontal)
         self.gamma_slider.setRange(10, 300)
-        self.gamma_slider.setValue(65)
+        self.gamma_slider.setValue(100)
         self.gamma_slider.valueChanged.connect(self._on_gamma_slider_changed)
         gamma_row.addWidget(self.gamma_slider)
         self.gamma_spin = QDoubleSpinBox()
         self.gamma_spin.setRange(0.10, 3.00)
         self.gamma_spin.setSingleStep(0.01)
         self.gamma_spin.setDecimals(2)
-        self.gamma_spin.setValue(0.65)
+        self.gamma_spin.setValue(1.00)
         self.gamma_spin.setFixedWidth(72)
         self.gamma_spin.setToolTip("Type an exact gamma value.")
         self.gamma_spin.valueChanged.connect(self._on_gamma_spin_changed)
@@ -2091,8 +2091,14 @@ class TEMVideoProcessor(QMainWindow):
         contrast_row = QHBoxLayout()
         contrast_row.addWidget(QLabel("CONTRAST"))
         self.contrast_combo = QComboBox()
-        self.contrast_combo.addItems(["AUTOCONTRAST", "CLAHE"])
+        self.contrast_combo.addItems(["AUTOCONTRAST", "CLAHE", "NONE"])
         self.contrast_combo.setCurrentIndex(0)
+        self.contrast_combo.setToolTip(
+            "AUTOCONTRAST/CLAHE enhance contrast automatically. NONE passes\n"
+            "the frame through untouched - use this to keep raw intensities\n"
+            "meaningful (e.g. diffraction patterns) instead of having them\n"
+            "auto-stretched."
+        )
         self.contrast_combo.currentIndexChanged.connect(self._on_contrast_changed)
         contrast_row.addWidget(self.contrast_combo)
         proc_layout.addLayout(contrast_row)
@@ -2150,8 +2156,7 @@ class TEMVideoProcessor(QMainWindow):
         self.filter_combo.setCurrentIndex(0)
         self.filter_combo.setToolTip(
             "NLM: cv2.fastNlMeansDenoising on CPU, or the GPU-accelerated "
-            "bilateral filter instead when a CUDA device is present (same "
-            "hardware-based choice as the NLM/BILATERAL DENOISING checkbox below)."
+            "bilateral filter instead when a CUDA device is present."
         )
         self.filter_combo.currentIndexChanged.connect(self._on_filter_changed)
         filter_row.addWidget(self.filter_combo)
@@ -2234,14 +2239,6 @@ class TEMVideoProcessor(QMainWindow):
         self.ff_status_label = QLabel("Flat field: not loaded")
         self.ff_status_label.setStyleSheet("color: #8a8b90; font-size: 8pt;")
         proc_layout.addWidget(self.ff_status_label)
-
-        self.nlm_cb = QCheckBox("NLM DENOISING" if not self.use_gpu else "BILATERAL DENOISING (GPU)")
-        self.nlm_cb.setToolTip(
-            "Denoise before filtering. Runs NLM (cv2.fastNlMeansDenoising) on CPU, "
-            "or a GPU-accelerated bilateral filter when a CUDA device is present."
-        )
-        self.nlm_cb.stateChanged.connect(self._on_settings_changed)
-        proc_layout.addWidget(self.nlm_cb)
 
         layout.addWidget(proc_group)
 
@@ -3084,11 +3081,8 @@ QLabel#fps_display {{
 
         self.processor.frame_count += 1
 
-        gamma = settings.get('gamma', 0.65)
+        gamma = settings.get('gamma', 1.0)
         processed = self.processor.apply_gamma_fast(processed, gamma)
-
-        if self.nlm_cb.isChecked():
-            processed = self._apply_denoise(processed)
 
         filter_mode = settings.get('filter_mode', 0)
         if filter_mode == 1:
@@ -3128,8 +3122,7 @@ QLabel#fps_display {{
         """Denoise a frame: NLM on CPU, or a GPU-accelerated bilateral filter
         when a CUDA device is present (cv2.cuda has no accelerated NLM
         implementation) - same hardware-based choice as tem_main.py. Called
-        either from the NLM/BILATERAL DENOISING checkbox (runs after gamma,
-        before the filter) or from the FILTER dropdown's NLM entry.
+        from the FILTER dropdown's NLM entry.
 
         cv2.fastNlMeansDenoising only accepts 8-bit input, so a 16-bit source
         without a GPU falls back to the same float32 bilateral round-trip
@@ -3380,7 +3373,7 @@ QLabel#fps_display {{
             self.del_seg_btn.setEnabled(True)
             seg = self.segments[idx]
             
-            self.gamma_slider.setValue(int(seg.settings.get('gamma', 0.65) * 100))
+            self.gamma_slider.setValue(int(seg.settings.get('gamma', 1.0) * 100))
             self.contrast_combo.setCurrentIndex(seg.settings.get('contrast_method', 0))
             self.ac_low_spin.setValue(seg.settings.get('autocontrast_low', 1.0))
             self.ac_high_spin.setValue(seg.settings.get('autocontrast_high', 99.0))
@@ -3437,7 +3430,7 @@ QLabel#fps_display {{
             self._go_to_frame(self.current_frame, force=True)
 
     def _reset_settings(self):
-        self.gamma_slider.setValue(65)
+        self.gamma_slider.setValue(100)
         self.contrast_combo.setCurrentIndex(0)
         self.ac_low_spin.setValue(1.0)
         self.ac_high_spin.setValue(99.0)
@@ -3456,7 +3449,6 @@ QLabel#fps_display {{
         self.edge_width_spin.setValue(40)
         self.apply_drift_cb.setChecked(False)
         self.ff_cb.setChecked(False)
-        self.nlm_cb.setChecked(False)
         self.drift_combo.setCurrentIndex(0)
         self._on_settings_changed()
 

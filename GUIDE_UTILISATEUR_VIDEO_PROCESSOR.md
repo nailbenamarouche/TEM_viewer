@@ -51,24 +51,27 @@ lecture avant**, pas en se déplaçant sur la ligne de temps — voir
 
 ## 4. Traitement d'image
 
-- **GAMMA** : curseur + champ de saisie exacte (défaut 0.65).
+- **GAMMA** : curseur + champ de saisie exacte (défaut 1.00, c'est-à-dire
+  aucun ajustement).
 - **CONTRAST** : **AUTOCONTRAST** (défaut) avec écrêtage par percentile
-  LOW%/HIGH% ajustable (défaut 1.0/99.0), ou **CLAHE** avec limite CLIP et
+  LOW%/HIGH% ajustable (défaut 1.0/99.0), **CLAHE** avec limite CLIP et
   taille TILE ajustables (défaut 2.0/8) — plus paramétrable ici que dans le
-  logiciel d'acquisition en direct.
+  logiciel d'acquisition en direct — ou **NONE**, qui laisse passer l'image
+  sans aucun traitement de contraste (utile pour conserver des intensités
+  brutes significatives, par ex. des diagrammes de diffraction). Notez que
+  NONE ne désactive que cette étape - GAMMA reste appliqué par-dessus,
+  laissez donc aussi GAMMA à 1.00 si vous voulez une image vraiment
+  inchangée.
 - **FILTER** : NONE / GAUSSIAN / MEDIAN / BILATERAL / NLM, chacun avec ses
-  propres paramètres (taille de noyau, sigma, etc.).
+  propres paramètres (taille de noyau, sigma, etc.). NLM est une
+  approximation rapide par filtre bilatéral sur CPU comme sur GPU, pas un
+  véritable Non-Local Means (trop lent en pratique sur CPU).
 - **FLAT FIELD CORRECTION** : cliquez sur **LOAD FLAT FIELD** pour choisir
   une image de référence noire, puis une image de gain/référence.
   Contrairement au logiciel d'acquisition en direct, il n'y a pas de chemin
   de fichier fixe — vous choisissez vous-même les images, qui sont
   automatiquement redimensionnées pour correspondre à la résolution de la
   vidéo chargée si nécessaire.
-- Case **NLM/BILATERAL DENOISING** (l'intitulé dépend de la détection d'un
-  GPU CUDA) : une passe de débruitage supplémentaire avant le FILTER
-  ci-dessus. Comme dans le logiciel d'acquisition en direct, il s'agit
-  d'une approximation rapide par filtre bilatéral sur CPU comme sur GPU, pas
-  d'un véritable Non-Local Means (trop lent en pratique sur CPU).
 
 ## 5. Correction de dérive
 
@@ -108,10 +111,9 @@ que cette case est encore décochée.
   que différentes parties d'une même vidéo peuvent recevoir un traitement
   différent — par exemple un segment en autocontraste, un autre en CLAHE
   avec un débruitage plus poussé.
-  - Remarque : les valeurs MARGIN/WIDTH d'edge-strip et la case de
-    débruitage NLM/Bilateral ne sont *pas* enregistrées par segment (ce
-    sont des réglages globaux uniques), seuls les éléments listés ci-dessus
-    le sont.
+  - Remarque : les valeurs MARGIN/WIDTH d'edge-strip ne sont *pas*
+    enregistrées par segment (ce sont des réglages globaux uniques), seuls
+    les éléments listés ci-dessus le sont.
   - Cliquer sur un segment dans la liste recharge ses réglages et déplace
     la ligne de temps/la sélection en conséquence — utile pour le relire ou
     l'ajuster avant de le réexporter. **DELETE** supprime le segment
@@ -144,10 +146,9 @@ directement n'en dispose pas, et la case reste désactivée.
   titre).
 - **SCREENSHOT** (bouton ou `C`) : enregistre l'image actuelle en PNG.
 - **RESET SETTINGS** : restaure le gamma, la méthode de contraste et ses
-  paramètres, le filtre et ses paramètres, le champ plat, le débruitage et
-  la correction de dérive (y compris redésactiver APPLY DRIFT CORRECTION) à
-  leurs valeurs par défaut. Ne touche pas à la vidéo chargée, aux segments,
-  ni au thème.
+  paramètres, le filtre et ses paramètres, le champ plat et la correction de
+  dérive (y compris redésactiver APPLY DRIFT CORRECTION) à leurs valeurs par
+  défaut. Ne touche pas à la vidéo chargée, aux segments, ni au thème.
 - **THEME** : DARK / LIGHT.
 - **FULLSCREEN** (case à cocher ou `F11`, `Échap` pour quitter).
 

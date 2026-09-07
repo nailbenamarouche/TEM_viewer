@@ -1698,6 +1698,15 @@ class TEMVideoProcessor(QMainWindow):
         # Processing objects
         self.processor = TEMProcessor()
         self.roi_tracker = ROITracker(min_size=32, max_size=512)
+
+        # Denoise (optional): NLM on CPU, or a GPU-accelerated bilateral
+        # filter when a CUDA device is present - same hardware-based choice
+        # as tem_main.py's live pipeline (cv2.cuda has no accelerated NLM).
+        try:
+            self.use_gpu = cv2.cuda.getCudaEnabledDeviceCount() > 0
+        except (AttributeError, cv2.error):
+            self.use_gpu = False
+        self.gpu_frame = cv2.cuda_GpuMat() if self.use_gpu else None
         self.tracker_initialized = False
         self._running = True
         self.enable_screenshot = False
@@ -2137,8 +2146,13 @@ class TEMVideoProcessor(QMainWindow):
         filter_row = QHBoxLayout()
         filter_row.addWidget(QLabel("FILTER"))
         self.filter_combo = QComboBox()
-        self.filter_combo.addItems(["NONE", "GAUSSIAN", "MEDIAN", "BILATERAL"])
+        self.filter_combo.addItems(["NONE", "GAUSSIAN", "MEDIAN", "BILATERAL", "NLM"])
         self.filter_combo.setCurrentIndex(0)
+        self.filter_combo.setToolTip(
+            "NLM: cv2.fastNlMeansDenoising on CPU, or the GPU-accelerated "
+            "bilateral filter instead when a CUDA device is present (same "
+            "hardware-based choice as the NLM/BILATERAL DENOISING checkbox below)."
+        )
         self.filter_combo.currentIndexChanged.connect(self._on_filter_changed)
         filter_row.addWidget(self.filter_combo)
         proc_layout.addLayout(filter_row)
@@ -2220,6 +2234,14 @@ class TEMVideoProcessor(QMainWindow):
         self.ff_status_label = QLabel("Flat field: not loaded")
         self.ff_status_label.setStyleSheet("color: #8a8b90; font-size: 8pt;")
         proc_layout.addWidget(self.ff_status_label)
+
+        self.nlm_cb = QCheckBox("NLM DENOISING" if not self.use_gpu else "BILATERAL DENOISING (GPU)")
+        self.nlm_cb.setToolTip(
+            "Denoise before filtering. Runs NLM (cv2.fastNlMeansDenoising) on CPU, "
+            "or a GPU-accelerated bilateral filter when a CUDA device is present."
+        )
+        self.nlm_cb.stateChanged.connect(self._on_settings_changed)
+        proc_layout.addWidget(self.nlm_cb)
 
         layout.addWidget(proc_group)
 
@@ -3064,7 +3086,10 @@ QLabel#fps_display {{
 
         gamma = settings.get('gamma', 0.65)
         processed = self.processor.apply_gamma_fast(processed, gamma)
-        
+
+        if self.nlm_cb.isChecked():
+            processed = self._apply_denoise(processed)
+
         filter_mode = settings.get('filter_mode', 0)
         if filter_mode == 1:
             k = settings.get('gaussian_kernel', 3)
@@ -3094,8 +3119,31 @@ QLabel#fps_display {{
                 processed = np.clip(np.round(filtered), 0, self.max_val).astype(np.uint16)
             else:
                 processed = cv2.bilateralFilter(processed, d, sc, ss)
-        
+        elif filter_mode == 4:
+            processed = self._apply_denoise(processed)
+
         return processed
+
+    def _apply_denoise(self, frame):
+        """Denoise a frame: NLM on CPU, or a GPU-accelerated bilateral filter
+        when a CUDA device is present (cv2.cuda has no accelerated NLM
+        implementation) - same hardware-based choice as tem_main.py. Called
+        either from the NLM/BILATERAL DENOISING checkbox (runs after gamma,
+        before the filter) or from the FILTER dropdown's NLM entry.
+
+        cv2.fastNlMeansDenoising only accepts 8-bit input, so a 16-bit source
+        without a GPU falls back to the same float32 bilateral round-trip
+        already used for the BILATERAL filter mode above - cv2.cuda.bilateralFilter
+        has no such restriction and accepts uint16 directly.
+        """
+        if self.use_gpu and self.gpu_frame is not None:
+            self.gpu_frame.upload(frame)
+            gpu_out = cv2.cuda.bilateralFilter(self.gpu_frame, 5, 25, 25)
+            return gpu_out.download()
+        if frame.dtype == np.uint16:
+            filtered = cv2.bilateralFilter(frame.astype(np.float32), 5, 25, 25)
+            return np.clip(np.round(filtered), 0, self.max_val).astype(np.uint16)
+        return cv2.fastNlMeansDenoising(frame, None, h=15, templateWindowSize=7, searchWindowSize=21)
 
     # ------------------------------------------------------------
     # DM4 METADATA OVERLAY
@@ -3408,6 +3456,7 @@ QLabel#fps_display {{
         self.edge_width_spin.setValue(40)
         self.apply_drift_cb.setChecked(False)
         self.ff_cb.setChecked(False)
+        self.nlm_cb.setChecked(False)
         self.drift_combo.setCurrentIndex(0)
         self._on_settings_changed()
 

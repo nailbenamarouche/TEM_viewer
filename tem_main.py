@@ -9,6 +9,7 @@ import threading
 import queue
 import os
 import re
+import json
 import xxhash
 import sys
 import traceback
@@ -17,7 +18,6 @@ from PyQt5.QtWidgets import *
 from PyQt5.QtCore import *
 from PyQt5.QtGui import *
 from PyQt5 import QtCore, QtGui, QtWidgets
-import matplotlib.pyplot as plt
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 from ximea import xiapi
@@ -35,8 +35,18 @@ RECORD_MODE = "raw"
 AUTO_FLUSH_EVERY = 1200
 RAM_CAP_MB = 8000  # 8GB safety limit
 
-# Set True to log per-frame CLAHE timing to console (diagnostic only).
-DEBUG_CLAHE_TIMING = True
+# Ceiling AEAG is allowed to push exposure to, in ms. This used to be pinned
+# to whatever the current manual exposure happened to be (e.g. 20-40ms),
+# which left AEAG with ~zero headroom to actually brighten a dim scene -
+# functionally indistinguishable from AEAG "not working". 80ms gives it real
+# range to react to lighting while still bounding the worst-case frame rate
+# (~12.5 FPS at the ceiling) to something tolerable.
+AEAG_MAX_EXPOSURE_MS = 80.0
+
+# Set True to log per-frame CLAHE timing to console (diagnostic only - a
+# print() every frame is itself expensive enough to tank FPS, so keep this
+# off unless actively debugging).
+DEBUG_CLAHE_TIMING = False
 
 # ==========================================
 # THEME STYLESHEETS
@@ -276,7 +286,7 @@ class ImageProcessingWorker(threading.Thread):
         self.bilateral_sigmaColor = 75
         self.bilateral_sigmaSpace = 75
 
-        self.contrast_method = 1  # 0: Autocontrast, 1: CLAHE, 2: None
+        self.contrast_method = 0  # 0: Autocontrast, 1: CLAHE, 2: None
         self.enable_flatfield = True
         self.D = None
         self.G = None
@@ -287,18 +297,44 @@ class ImageProcessingWorker(threading.Thread):
             self.use_gpu = cv2.cuda.getCudaEnabledDeviceCount() > 0
         except (AttributeError, cv2.error):
             self.use_gpu = False
+
+        self.gpu_frame = None
+        self.gpu_result = None
+        self.gpu_clahe = None
+        self.clahe = None
+
+        # CLAHE parameters. GPU setup (context/buffer alloc) can still fail
+        # even when a CUDA device is reported (missing cudaimgproc, driver
+        # mismatch, out of VRAM, opencv built without the module) - fall back
+        # to the CPU CLAHE object rather than crashing the worker thread.
+        if self.use_gpu:
+            try:
+                self.gpu_frame = cv2.cuda_GpuMat()
+                self.gpu_result = cv2.cuda_GpuMat()
+                self.gpu_clahe = cv2.cuda.createCLAHE(clipLimit=1.5, tileGridSize=(16, 16))
+            except (AttributeError, cv2.error) as e:
+                print(f"GPU init failed ({e}), falling back to CPU")
+                self.use_gpu = False
+                self.gpu_frame = None
+                self.gpu_result = None
+                self.gpu_clahe = None
+
+        if not self.use_gpu:
+            self.clahe = cv2.createCLAHE(clipLimit=1.5, tileGridSize=(16, 16))
+
         print(f"Worker using GPU: {self.use_gpu}")
 
-        self.gpu_frame = cv2.cuda_GpuMat() if self.use_gpu else None
-        self.gpu_result = cv2.cuda_GpuMat() if self.use_gpu else None
-        
-        # CLAHE parameters
+    def _disable_gpu(self, reason):
+        """Runtime fallback: a GPU call failed mid-stream (driver hiccup, VRAM
+        exhaustion, etc). Log it once, permanently switch this worker to the
+        CPU path, and lazily create the CPU CLAHE object if it doesn't exist
+        yet, so the current frame - and every frame after it - can still be
+        processed instead of the pipeline erroring out repeatedly."""
         if self.use_gpu:
-            self.gpu_clahe = cv2.cuda.createCLAHE(clipLimit=1.5, tileGridSize=(16, 16))
-            self.clahe = None
-        else:
+            print(f"[GPU FALLBACK] {reason} - switching to CPU for the rest of this session")
+        self.use_gpu = False
+        if self.clahe is None:
             self.clahe = cv2.createCLAHE(clipLimit=1.5, tileGridSize=(16, 16))
-            self.gpu_clahe = None
 
     def run(self):
         """Thread entry point: pulls raw frames from input_queue, runs apply_pipeline
@@ -324,10 +360,18 @@ class ImageProcessingWorker(threading.Thread):
                 traceback.print_exc()
 
     def apply_pipeline(self, frame):
-        """Runs the full per-frame processing chain: flat-field correction, gamma/
-        brightness/contrast, the selected denoise filter (Gaussian/median/bilateral),
-        optional NLM denoising, then CLAHE or autocontrast - using the GPU path for
-        CLAHE/NLM when available.
+        """Runs the full per-frame processing chain: flat-field correction, the
+        selected denoise filter (Gaussian/median/bilateral), optional NLM
+        denoising, CLAHE or autocontrast, then gamma/brightness/contrast last -
+        using the GPU path for CLAHE/NLM when available.
+
+        Gamma/brightness/contrast run *after* CLAHE/autocontrast rather than
+        before: CLAHE and autocontrast both renormalize the image's dynamic
+        range from whatever comes in, so a manual adjustment applied earlier
+        in the chain was being largely stretched back out and made
+        invisible on screen. Running them last makes the sliders behave like
+        a final tone adjustment on top of the enhanced image, so they always
+        have a visible effect regardless of which contrast method is active.
 
         Args:
             frame: Raw grayscale frame from the camera.
@@ -340,15 +384,7 @@ class ImageProcessingWorker(threading.Thread):
             if frame.shape == self.D.shape:
                 frame = np.clip((frame.astype(np.float32) - self.D) * self.G, 0, 255).astype(np.uint8)
 
-        # 2. Gamma & Brightness/Contrast
-        if self.gamma != 1.0:
-            lut = np.array([((i / 255.0) ** self.gamma) * 255 for i in np.arange(0, 256)]).astype("uint8")
-            frame = cv2.LUT(frame, lut)
-        
-        if self.brightness != 0.0 or self.contrast != 1.0:
-            frame = np.clip(frame.astype(np.float32) * self.contrast + self.brightness, 0, 255).astype(np.uint8)
-
-        # 3. NEW: Apply Gaussian, Median, or Bilateral filters
+        # 2. Apply Gaussian, Median, or Bilateral filters
         if self.filter_type == 1:  # Gaussian
             k = self.gaussian_kernel if self.gaussian_kernel % 2 == 1 else self.gaussian_kernel + 1
             frame = cv2.GaussianBlur(frame, (k, k), self.gaussian_sigma)
@@ -359,32 +395,51 @@ class ImageProcessingWorker(threading.Thread):
             d = self.bilateral_d if self.bilateral_d % 2 == 1 else self.bilateral_d + 1
             frame = cv2.bilateralFilter(frame, d, self.bilateral_sigmaColor, self.bilateral_sigmaSpace)
 
-        # 4. NLM Denoising
+        # 3. NLM Denoising
+        # Note: "NLM" here is a fast bilateral-filter approximation, not true
+        # fastNlMeansDenoising - true NLM's searchWindowSize=21 cost is O(n^2)
+        # and routinely takes 150-250ms/frame on CPU (4-6 FPS), which defeats
+        # a live TEM view. The GPU path already used this bilateral shortcut;
+        # the CPU path now mirrors it with identical parameters instead of
+        # falling back to the much slower "real" NLM.
         if self.enable_nlm:
             if self.use_gpu and self.gpu_frame is not None and self.gpu_result is not None:
-                self.gpu_frame.upload(frame)
-                cv2.cuda.bilateralFilter(self.gpu_frame, self.gpu_result, d=5, sigmaColor=25, sigmaSpace=25)
-                processed = self.gpu_result  # left on the GPU in case CLAHE runs next too
+                try:
+                    self.gpu_frame.upload(frame)
+                    cv2.cuda.bilateralFilter(self.gpu_frame, self.gpu_result, d=5, sigmaColor=25, sigmaSpace=25)
+                    processed = self.gpu_result  # left on the GPU in case CLAHE runs next too
+                except cv2.error as e:
+                    self._disable_gpu(f"GPU NLM/bilateral failed ({e})")
+                    processed = cv2.bilateralFilter(frame, d=5, sigmaColor=25, sigmaSpace=25)
             else:
-                processed = cv2.fastNlMeansDenoising(frame, None, h=15, templateWindowSize=7, searchWindowSize=21)
+                processed = cv2.bilateralFilter(frame, d=5, sigmaColor=25, sigmaSpace=25)
         else:
             processed = frame
 
-        # 5. CLAHE or Autocontrast
+        # 4. CLAHE or Autocontrast
         if self.contrast_method == 1:  # CLAHE
             t0 = time.perf_counter() if self.debug_timing else None
             if self.use_gpu and self.gpu_clahe is not None and self.gpu_frame is not None and self.gpu_result is not None:
-                if isinstance(processed, cv2.cuda_GpuMat):
-                    # NLM's output is already resident on the GPU - chain straight into
-                    # CLAHE instead of downloading to CPU and re-uploading, which would
-                    # cost an extra PCIe round trip every frame. Always target the other
-                    # buffer so CLAHE never reads and writes the same GpuMat.
-                    src, dst = self.gpu_result, self.gpu_frame
-                else:
-                    self.gpu_frame.upload(processed)
-                    src, dst = self.gpu_frame, self.gpu_result
-                self.gpu_clahe.apply(src, dst)
-                processed = dst
+                try:
+                    if isinstance(processed, cv2.cuda_GpuMat):
+                        # NLM's output is already resident on the GPU - chain straight into
+                        # CLAHE instead of downloading to CPU and re-uploading, which would
+                        # cost an extra PCIe round trip every frame. Always target the other
+                        # buffer so CLAHE never reads and writes the same GpuMat.
+                        src, dst = self.gpu_result, self.gpu_frame
+                    else:
+                        self.gpu_frame.upload(processed)
+                        src, dst = self.gpu_frame, self.gpu_result
+                    self.gpu_clahe.apply(src, dst)
+                    processed = dst
+                except cv2.error as e:
+                    self._disable_gpu(f"GPU CLAHE failed ({e})")
+                    if isinstance(processed, cv2.cuda_GpuMat):
+                        # Recover whatever NLM already produced (still valid on
+                        # the GPU) rather than discarding it and re-running
+                        # CLAHE on the un-denoised frame.
+                        processed = processed.download()
+                    processed = self.clahe.apply(processed)
             elif self.clahe is not None:
                 if isinstance(processed, cv2.cuda_GpuMat):
                     processed = processed.download()
@@ -400,6 +455,16 @@ class ImageProcessingWorker(threading.Thread):
 
         if isinstance(processed, cv2.cuda_GpuMat):
             processed = processed.download()
+
+        # 5. Gamma & Brightness/Contrast - see the docstring above for why this
+        # runs last rather than right after flat-field correction.
+        if self.gamma != 1.0:
+            lut = np.array([((i / 255.0) ** self.gamma) * 255 for i in np.arange(0, 256)]).astype("uint8")
+            processed = cv2.LUT(processed, lut)
+
+        if self.brightness != 0.0 or self.contrast != 1.0:
+            processed = np.clip(processed.astype(np.float32) * self.contrast + self.brightness, 0, 255).astype(np.uint8)
+
         return processed
 
     def stop(self):
@@ -584,7 +649,7 @@ class RawBufferWriter:
     so acquisition can keep writing to a fresh instance while the previous one
     encodes in the background."""
 
-    def __init__(self, audio_device=None, record_audio=False, encoder_choice="GPU (hevc_nvenc) - Fast", encoding_mode="High Quality (CQ)", cq_value="12", bitrate_value="8M"):
+    def __init__(self, audio_device=None, record_audio=False, encoder_choice="CPU (libx265) - Smallest", encoding_mode="High Quality (CQ)", cq_value="12", bitrate_value="8M"):
         self.buffer = []
         self.frame_count = 0
         self._running = False
@@ -657,6 +722,22 @@ class RawBufferWriter:
     def get_ram_usage_mb(self):
         """Returns the current buffer's memory footprint in megabytes."""
         return self.current_buffer_bytes / (1024 * 1024)
+
+    def _resolve_cq_value(self):
+        """Validates self.cq_value (free-typed UI text) as an ffmpeg -cq/-crf
+        argument, in the 0-51 range both hevc_nvenc and libx265 accept. This
+        used to be ignored entirely - the "High Quality (CQ)" branches had
+        '12' hardcoded regardless of what was typed here, which is why the
+        field appeared to do nothing (or "do the opposite": a lower number
+        means *higher* quality/bigger file for both -cq and -crf, so typing a
+        bigger number expecting a bigger file is backwards either way)."""
+        try:
+            val = int(self.cq_value)
+        except (TypeError, ValueError):
+            self._log(f"Invalid CQ/CRF value '{self.cq_value}', defaulting to 20")
+            return "20"
+        val = max(0, min(51, val))
+        return str(val)
 
     def flush_to_disk(self, output_path, width, height, fps=25):
         """Encodes the buffered frames to output_path via ffmpeg, in one batch.
@@ -732,7 +813,7 @@ class RawBufferWriter:
             else:
                 cmd.extend([
                     '-c:v', 'hevc_nvenc',
-                    '-cq', '12',
+                    '-cq', self._resolve_cq_value(),
                     '-preset', 'p4',
                     '-pix_fmt', 'yuv420p',
                 ])
@@ -749,7 +830,7 @@ class RawBufferWriter:
             else:
                 cmd.extend([
                     '-c:v', 'libx265',
-                    '-crf', '12',
+                    '-crf', self._resolve_cq_value(),
                     '-preset', 'veryfast',
                     '-pix_fmt', 'yuv420p',
                 ])
@@ -858,7 +939,7 @@ class DoubleBufferedWriter:
     fresh buffer while the previous segment encodes to disk in the background
     (auto-flushing every auto_flush_every frames, or on explicit pause/quit)."""
 
-    def __init__(self, auto_flush_every=100, audio_device=None, record_audio=False, encoder_choice="GPU (hevc_nvenc) - Fast", encoding_mode="High Quality (CQ)", cq_value="12", bitrate_value="8M"):
+    def __init__(self, auto_flush_every=100, audio_device=None, record_audio=False, encoder_choice="CPU (libx265) - Smallest", encoding_mode="High Quality (CQ)", cq_value="12", bitrate_value="8M"):
         self.auto_flush_every = auto_flush_every
         self.audio_device = audio_device or "audio=Desktop Microphone (RØDE NT-USB+)"
         self.record_audio = record_audio
@@ -1079,11 +1160,28 @@ class FrameToFrameTracker:
     """Tracks sample drift frame-to-frame via phase correlation on the four edge
     strips of the image, accumulating a running (dx, dy) correction offset."""
 
-    def __init__(self, strip_width=40):
+    def __init__(self, strip_width=40, margin=0):
         self.strip_width = strip_width
+        # Distance the strip is inset from the true frame border. TEM
+        # footage is frequently a circular illuminated field on a black
+        # background (vignette), so a strip sampled right at pixel 0 can
+        # be 100% black with zero texture to correlate on - margin lets
+        # the sampled band start further inside the frame, past the
+        # vignette, where real content actually exists. Margin also trims
+        # each strip's *length* inward by the same amount at both ends, not
+        # just its depth from the edge - a full-width top/bottom strip (or
+        # full-height left/right strip) still runs through all four corners
+        # regardless of depth, and for a circular FOV the corners are
+        # outside the illuminated circle no matter how deep the strip sits.
+        # Without trimming the ends too, roughly half of every strip stays
+        # pure black vignette forever, diluting the correlation regardless
+        # of margin - this was the main reason edge-strip kept failing to
+        # track any real movement even after margin was introduced.
+        self.margin = margin
         self.prev_strips = {}
         self.cumulative_dx = 0.0
         self.cumulative_dy = 0.0
+        self._hann_cache = {}
 
     def initialize(self, frame):
         """Anchors the tracker on frame, resetting accumulated drift to zero.
@@ -1102,17 +1200,18 @@ class FrameToFrameTracker:
     def _extract_strips(self, frame):
         h, w = frame.shape[:2]
         s = self.strip_width
+        m = max(0, min(self.margin, min(h, w) // 2 - s))
         strips = {}
-        top = frame[0:s, :]
+        top = frame[m:m+s, m:w-m]
         if top.size > 0:
             strips['top'] = self._normalize(top)
-        bottom = frame[h-s:h, :]
+        bottom = frame[h-m-s:h-m, m:w-m]
         if bottom.size > 0:
             strips['bottom'] = self._normalize(bottom)
-        left = frame[:, 0:s]
+        left = frame[m:h-m, m:m+s]
         if left.size > 0:
             strips['left'] = self._normalize(left)
-        right = frame[:, w-s:w]
+        right = frame[m:h-m, w-m-s:w-m]
         if right.size > 0:
             strips['right'] = self._normalize(right)
         return strips
@@ -1120,6 +1219,19 @@ class FrameToFrameTracker:
     def _normalize(self, img):
         f = img.astype(np.float32)
         return (f - f.mean()) / (f.std() + 1e-6)
+
+    def _get_hann(self, shape):
+        """Returns a cached Hanning window for shape (h, w). phaseCorrelate
+        assumes its input is periodic; a strip's hard-cropped edges violate
+        that and leak spurious high-frequency energy into the correlation,
+        which a window suppresses. Cached per shape since all four strips
+        typically share only two distinct shapes (top/bottom vs left/right)."""
+        key = (shape[0], shape[1])
+        win = self._hann_cache.get(key)
+        if win is None:
+            win = cv2.createHanningWindow((shape[1], shape[0]), cv2.CV_32F)
+            self._hann_cache[key] = win
+        return win
 
     def compute_drift(self, frame):
         """Estimates drift since the last call by correlating edge strips against the previous frame.
@@ -1139,19 +1251,26 @@ class FrameToFrameTracker:
                 continue
             if prev_strip.shape != curr_strips[name].shape:
                 continue
-            try: 
-                (dx, dy), conf = cv2.phaseCorrelate(prev_strip, curr_strips[name])
+            try:
+                window = self._get_hann(prev_strip.shape)
+                (dx, dy), conf = cv2.phaseCorrelate(prev_strip, curr_strips[name], window)
             except cv2.error as e:
                 print(f"Phase correlate error: {e}")
                 continue
             if conf < 0.001:
-                continue            
-            if abs(dx) > 20 or abs(dy) > 20:
+                continue
+            # Sanity cap on a single strip's estimate, not a search-window
+            # limit like ROITracker's - phaseCorrelate always searches the
+            # whole strip, so this only exists to reject nonsense outputs.
+            # Raised from 20 to strip_width*2 so genuinely fast drift during
+            # active straining doesn't get thrown out as if it were noise.
+            max_shift = max(20, self.strip_width * 2)
+            if abs(dx) > max_shift or abs(dy) > max_shift:
                 continue
             shifts.append((dx, dy, conf))
         reliability = len(shifts) / 4.0
         self.prev_strips = curr_strips
-        if len(shifts) < 2:
+        if len(shifts) == 0:
             return self.cumulative_dx, self.cumulative_dy, reliability
         if len(shifts) >= 3:
             median_dx = float(np.median([s[0] for s in shifts]))
@@ -1162,6 +1281,10 @@ class FrameToFrameTracker:
             frame_dx = float(np.mean([s[0] for s in best_shifts]))
             frame_dy = float(np.mean([s[1] for s in best_shifts]))
         else:
+            # 1 or 2 valid strips: average whatever there is rather than
+            # requiring 2+ and freezing - a circular FOV often leaves only
+            # one or two edges with real texture no matter how margin is
+            # tuned, and using a single reliable strip beats no correction.
             frame_dx = float(np.mean([s[0] for s in shifts]))
             frame_dy = float(np.mean([s[1] for s in shifts]))
         self.cumulative_dx += frame_dx
@@ -1184,10 +1307,11 @@ class FrameToFrameTracker:
             vis = image.copy()
         h, w = vis.shape[:2]
         s = self.strip_width
-        cv2.rectangle(vis, (0, 0), (w, s), color, 2)
-        cv2.rectangle(vis, (0, h-s), (w, h), color, 2)
-        cv2.rectangle(vis, (0, 0), (s, h), color, 2)
-        cv2.rectangle(vis, (w-s, 0), (w, h), color, 2)
+        m = max(0, min(self.margin, min(h, w) // 2 - s))
+        cv2.rectangle(vis, (m, m), (w-m, m+s), color, 2)
+        cv2.rectangle(vis, (m, h-m-s), (w-m, h-m), color, 2)
+        cv2.rectangle(vis, (m, m), (m+s, h-m), color, 2)
+        cv2.rectangle(vis, (w-m-s, m), (w-m, h-m), color, 2)
         return vis
 
     def reset(self):
@@ -1213,6 +1337,13 @@ class ROITracker:
         self.template_pos = None
         self.template_center = None
         self.frame_center = None
+        # Top-left of the template's last known location, re-centered on every
+        # successful match. Searching around this (rather than the original
+        # lock-time position) is what lets total drift grow without bound -
+        # only the per-frame *step* has to stay inside search_margin, instead
+        # of the template having to stay within search_margin of where it
+        # started forever.
+        self.current_pos = None
         self.cumulative_dx = 0.0
         self.cumulative_dy = 0.0
         self.last_dx = 0.0
@@ -1220,6 +1351,11 @@ class ROITracker:
         self.search_margin = 80
         self.confidence_threshold = 0.15
         self.damping = 0.6
+        # Consecutive low-confidence frames. When this climbs, compute_offset
+        # widens its search window (up to the full frame) to try to relocate
+        # the template after a fast/large jump instead of staying stuck
+        # forever inside a search window centered on a now-stale position.
+        self.lost_frames = 0
 
     def start_selection(self):
         """Enters ROI-selection mode, clearing any previously locked template.
@@ -1233,10 +1369,12 @@ class ROITracker:
         self.roi_locked = False
         self.template = None
         self.template_pos = None
+        self.current_pos = None
         self.cumulative_dx = 0.0
         self.cumulative_dy = 0.0
         self.last_dx = 0.0
         self.last_dy = 0.0
+        self.lost_frames = 0
         return True
 
     def on_mouse_down(self, x, y):
@@ -1324,11 +1462,13 @@ class ROITracker:
         self.template_pos = (x1, y1, w, h)
         self.template_center = (x1 + w / 2.0, y1 + h / 2.0)
         self.frame_center = (w_frame / 2.0, h_frame / 2.0)
+        self.current_pos = (x1, y1)
 
         self.selecting = False
         self.roi_locked = True
         self.cumulative_dx = 0.0
         self.cumulative_dy = 0.0
+        self.lost_frames = 0
         return True
 
     def compute_offset(self, frame):
@@ -1349,17 +1489,28 @@ class ROITracker:
         if not self.roi_locked or self.template is None:
             return 0.0, 0.0, 0.0
         h_frame, w_frame = frame.shape[:2]
-        tx, ty, tw, th = self.template_pos
+        tw, th = self.template_pos[2], self.template_pos[3]
+        tx, ty = self.current_pos if self.current_pos is not None else self.template_pos[:2]
 
-        sx1 = max(0, tx - self.search_margin)
-        sy1 = max(0, ty - self.search_margin)
-        sx2 = min(w_frame, tx + tw + self.search_margin)
-        sy2 = min(h_frame, ty + th + self.search_margin)
+        # Widen the search window the longer the template has gone unfound,
+        # up to covering the whole frame. A fixed search_margin around the
+        # last known position only tolerates a bounded per-frame step; a fast
+        # stage jog or a brief occlusion during straining can outrun that in
+        # one frame, and without this the tracker would stay stuck searching
+        # the same stale neighborhood forever ("suddenly it breaks").
+        effective_margin = self.search_margin * (1 + min(self.lost_frames, 10))
+        effective_margin = min(effective_margin, max(w_frame, h_frame))
+
+        sx1 = max(0, int(tx - effective_margin))
+        sy1 = max(0, int(ty - effective_margin))
+        sx2 = min(w_frame, int(tx + tw + effective_margin))
+        sy2 = min(h_frame, int(ty + th + effective_margin))
 
         sw = sx2 - sx1
         sh = sy2 - sy1
 
         if sw < tw or sh < th:
+            self.lost_frames += 1
             return self.last_dx, self.last_dy, 0.0
 
         if frame.dtype != np.uint8:
@@ -1373,15 +1524,19 @@ class ROITracker:
             result = cv2.matchTemplate(search_region, self.template, cv2.TM_CCOEFF_NORMED)
         except cv2.error as e:
             print(f"Match template error: {e}")
+            self.lost_frames += 1
             return self.last_dx, self.last_dy, 0.0
 
         _, max_val, _, max_loc = cv2.minMaxLoc(result)
 
         if max_val < self.confidence_threshold:
+            self.lost_frames += 1
             return self.last_dx, self.last_dy, max_val
 
+        self.lost_frames = 0
         match_x = sx1 + max_loc[0]
         match_y = sy1 + max_loc[1]
+        self.current_pos = (match_x, match_y)
 
         current_cx = match_x + tw / 2.0
         current_cy = match_y + th / 2.0
@@ -1413,10 +1568,12 @@ class ROITracker:
         self.template = None
         self.template_pos = None
         self.template_center = None
+        self.current_pos = None
         self.cumulative_dx = 0.0
         self.cumulative_dy = 0.0
         self.last_dx = 0.0
         self.last_dy = 0.0
+        self.lost_frames = 0
 
     def get_selection_rect(self):
         """Returns the in-progress selection as (x, y, width, height) in display
@@ -1434,149 +1591,35 @@ class ROITracker:
 # HISTOGRAM WINDOW
 # ==========================================
 class HistogramWindow(QMainWindow):
-    """Secondary window showing the live camera image alongside its intensity
-    histogram, CDF, image statistics, and an optional equalized preview."""
+    """Secondary window showing a live intensity histogram of the current
+    camera image - deliberately just the plot, matching the simple histogram
+    in tem_video_processor.py rather than the old multi-panel (CDF/stats/
+    equalized-preview) version."""
 
     def __init__(self, camera_source):
         super().__init__()
         self.camera_source = camera_source
-        self.setWindowTitle("Histogram Mode")
-        self.setGeometry(100, 100, 1200, 800)
+        self.setWindowTitle("Histogram")
+        self.setGeometry(100, 100, 500, 400)
         self.setStyleSheet(build_theme_stylesheet(camera_source._theme))
         self._running = True
-        self._last_image = None
-        self.hist_bins = 256
-        self.show_cdf = False
-        self.show_equalized = False
-        self.histogram_type = "Full"
-        self.region_fraction = 0.3
-        self._build_layout()
+
+        self.figure = Figure(figsize=(4, 3), dpi=100, facecolor='#1a1b1e')
+        self.ax = self.figure.add_subplot(111)
+        self.ax.set_xlabel("Intensity", color='#8a8b90')
+        self.ax.set_ylabel("Frequency", color='#8a8b90')
+        self.ax.grid(True, alpha=0.15, color='#3a3b40')
+        self.ax.set_facecolor('#1a1b1e')
+        self.ax.tick_params(colors='#8a8b90')
+        self.ax.bar(range(256), [0] * 256, color='#5b86ad', alpha=0.85, width=1.0)
+        self.ax.set_xlim(0, 255)
+
+        self.canvas = FigureCanvas(self.figure)
+        self.setCentralWidget(self.canvas)
+
         self.timer = QTimer()
         self.timer.timeout.connect(self._update)
-        self.timer.start(50)
-
-    def _build_layout(self):
-        central_widget = QWidget()
-        self.setCentralWidget(central_widget)
-        main_layout = QHBoxLayout(central_widget)
-        main_layout.setContentsMargins(5, 5, 5, 5)
-        main_layout.setSpacing(5)
-
-        image_group = QGroupBox("Image with Histogram Overlay")
-        image_layout = QVBoxLayout(image_group)
-        self.image_label = QLabel()
-        self.image_label.setObjectName("image_label")
-        self.image_label.setAlignment(Qt.AlignCenter)
-        self.image_label.setMinimumSize(500, 500)
-        image_layout.addWidget(self.image_label)
-        main_layout.addWidget(image_group, 2)
-
-        right_panel = QWidget()
-        right_layout = QVBoxLayout(right_panel)
-        right_layout.setContentsMargins(0, 0, 0, 0)
-        right_layout.setSpacing(5)
-
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-
-        scroll_content = QWidget()
-        scroll_layout = QVBoxLayout(scroll_content)
-        scroll_layout.setContentsMargins(5, 5, 5, 5)
-        scroll_layout.setSpacing(5)
-
-        controls_group = QGroupBox("Histogram Controls")
-        controls_layout = QVBoxLayout(controls_group)
-
-        controls_layout.addWidget(QLabel("Histogram Type:"))
-        self.type_combo = QComboBox()
-        self.type_combo.addItems(["Full Image", "Region", "Center"])
-        self.type_combo.currentTextChanged.connect(self._on_type_changed)
-        controls_layout.addWidget(self.type_combo)
-
-        controls_layout.addWidget(QLabel("Region Size (% of image):"))
-        self.region_slider = QSlider(Qt.Horizontal)
-        self.region_slider.setRange(5, 80)
-        self.region_slider.setValue(30)
-        self.region_slider.valueChanged.connect(self._on_region_changed)
-        controls_layout.addWidget(self.region_slider)
-        self.region_label = QLabel("30%")
-        self.region_slider.valueChanged.connect(lambda v: self.region_label.setText(f"{v}%"))
-        controls_layout.addWidget(self.region_label)
-
-        controls_layout.addWidget(QLabel("Number of Bins:"))
-        self.bins_slider = QSlider(Qt.Horizontal)
-        self.bins_slider.setRange(32, 512)
-        self.bins_slider.setValue(256)
-        self.bins_slider.valueChanged.connect(lambda v: setattr(self, 'hist_bins', v))
-        controls_layout.addWidget(self.bins_slider)
-        self.bins_label = QLabel("256")
-        self.bins_slider.valueChanged.connect(self.bins_label.setText)
-        controls_layout.addWidget(self.bins_label)
-
-        self.show_cdf_cb = QCheckBox("Show Cumulative Distribution (CDF)")
-        self.show_cdf_cb.toggled.connect(lambda v: setattr(self, 'show_cdf', v))
-        controls_layout.addWidget(self.show_cdf_cb)
-
-        self.show_equalized_cb = QCheckBox("Show Histogram Equalized Image")
-        self.show_equalized_cb.toggled.connect(lambda v: setattr(self, 'show_equalized', v))
-        controls_layout.addWidget(self.show_equalized_cb)
-
-        scroll_layout.addWidget(controls_group)
-
-        stats_group = QGroupBox("Image Statistics")
-        stats_layout = QVBoxLayout(stats_group)
-        self.stats_label = QLabel("Mean: --\nStd Dev: --\nMin: --\nMax: --\nMedian: --")
-        stats_layout.addWidget(self.stats_label)
-        scroll_layout.addWidget(stats_group)
-
-        plt.style.use('dark_background')
-        self.figure = Figure(figsize=(4, 3), dpi=100, facecolor='#1e1e1e')
-        self.ax = self.figure.add_subplot(111)
-        self.ax.set_xlabel("Pixel Intensity", color='#d4d4d4')
-        self.ax.set_ylabel("Frequency", color='#d4d4d4')
-        self.ax.grid(True, alpha=0.3, color='#3a3a3a')
-        self.ax.set_facecolor('#1e1e1e')
-        self.ax.tick_params(colors='#d4d4d4')
-        self.canvas = FigureCanvas(self.figure)
-        self.canvas.setMinimumHeight(250)
-        scroll_layout.addWidget(self.canvas)
-
-        self.figure2 = Figure(figsize=(4, 2), dpi=100, facecolor='#1e1e1e')
-        self.ax2 = self.figure2.add_subplot(111)
-        self.ax2.set_xlabel("Pixel Intensity", color='#d4d4d4')
-        self.ax2.set_ylabel("Cumulative Probability", color='#d4d4d4')
-        self.ax2.grid(True, alpha=0.3, color='#3a3a3a')
-        self.ax2.set_facecolor('#1e1e1e')
-        self.ax2.tick_params(colors='#d4d4d4')
-        self.canvas2 = FigureCanvas(self.figure2)
-        self.canvas2.setMinimumHeight(150)
-        scroll_layout.addWidget(self.canvas2)
-
-        eq_group = QGroupBox("Equalized Image Preview")
-        eq_layout = QVBoxLayout(eq_group)
-        self.eq_label = QLabel()
-        self.eq_label.setObjectName("image_label")
-        self.eq_label.setAlignment(Qt.AlignCenter)
-        self.eq_label.setMinimumHeight(100)
-        eq_layout.addWidget(self.eq_label)
-        scroll_layout.addWidget(eq_group)
-
-        export_btn = QPushButton("Export Histogram Data")
-        export_btn.clicked.connect(self._export_histogram)
-        scroll_layout.addWidget(export_btn)
-
-        scroll.setWidget(scroll_content)
-        right_layout.addWidget(scroll)
-        main_layout.addWidget(right_panel, 1)
-
-    def _on_type_changed(self, text):
-        self.histogram_type = text.replace(" ", "")
-        self.region_slider.setEnabled(text != "Full Image")
-
-    def _on_region_changed(self, value):
-        self.region_fraction = value / 100.0
+        self.timer.start(100)
 
     def _update(self):
         if not self._running:
@@ -1584,170 +1627,23 @@ class HistogramWindow(QMainWindow):
         image = self.camera_source.get_current_image()
         if image is None:
             return
-        self._last_image = image
-        if self.histogram_type == "Full":
-            roi = image
-        elif self.histogram_type == "Region":
-            h, w = image.shape[:2]
-            margin_x = int(w * (1 - self.region_fraction) / 2)
-            margin_y = int(h * (1 - self.region_fraction) / 2)
-            roi = image[margin_y:h - margin_y, margin_x:w - margin_x]
-        else:
-            h, w = image.shape[:2]
-            crop_size = int(min(h, w) * self.region_fraction)
-            margin_x = (w - crop_size) // 2
-            margin_y = (h - crop_size) // 2
-            roi = image[margin_y:margin_y + crop_size, margin_x:margin_x + crop_size]
-
-        hist = cv2.calcHist([roi], [0], None, [self.hist_bins], [0, 256])
-        hist = hist / hist.sum()
-        cdf = hist.cumsum()
-
-        display = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
-        self._draw_roi_overlay(display)
-        self._render_image(display)
-
-        self._update_histogram_plot(hist)
-        self._update_cdf_plot(cdf)
-        self._update_stats(roi)
-
-        if self.show_equalized:
-            self._update_equalized(roi)
-
-    def _draw_roi_overlay(self, display):
-        h, w = display.shape[:2]
-        if self.histogram_type == "Full":
-            cv2.rectangle(display, (0, 0), (w, h), (0, 255, 0), 2)
-            return
-        if self.histogram_type == "Region":
-            margin_x = int(w * (1 - self.region_fraction) / 2)
-            margin_y = int(h * (1 - self.region_fraction) / 2)
-            cv2.rectangle(display, (margin_x, margin_y), (w - margin_x, h - margin_y), (0, 255, 255), 2)
-        else:
-            crop_size = int(min(h, w) * self.region_fraction)
-            margin_x = (w - crop_size) // 2
-            margin_y = (h - crop_size) // 2
-            cv2.rectangle(display, (margin_x, margin_y), (margin_x + crop_size, margin_y + crop_size), (0, 255, 255), 2)
-
-    def _update_histogram_plot(self, hist):
-        self.ax.clear()
-        bin_edges = np.linspace(0, 256, self.hist_bins + 1)
-        bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
-        self.ax.bar(bin_centers, hist, width=256/self.hist_bins, color='#4a9eff', alpha=0.7, edgecolor='#4a9eff', linewidth=0.5)
-        if self._last_image is not None:
-            mean_val = self._last_image.mean()
-            self.ax.axvline(mean_val, color='#ff6b6b', linestyle='--', linewidth=2, label=f'Mean: {mean_val:.1f}')
-            self.ax.legend()
-        self.ax.set_xlabel("Pixel Intensity", color='#d4d4d4')
-        self.ax.set_ylabel("Probability", color='#d4d4d4')
-        self.ax.grid(True, alpha=0.3, color='#3a3a3a')
-        self.ax.set_facecolor('#1e1e1e')
-        self.ax.tick_params(colors='#d4d4d4')
-        self.ax.set_title("Intensity Distribution", color='#d4d4d4')
-        self.canvas.draw()
-
-    def _update_cdf_plot(self, cdf):
-        if not self.show_cdf:
-            self.figure2.clear()
-            self.ax2 = self.figure2.add_subplot(111)
-            self.ax2.set_xlabel("Pixel Intensity", color='#d4d4d4')
-            self.ax2.set_ylabel("Cumulative Probability", color='#d4d4d4')
-            self.ax2.grid(True, alpha=0.3, color='#3a3a3a')
-            self.ax2.set_facecolor('#1e1e1e')
-            self.ax2.tick_params(colors='#d4d4d4')
-            self.canvas2.draw()
-            return
-        self.ax2.clear()
-        bin_edges = np.linspace(0, 256, self.hist_bins + 1)
-        bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
-        self.ax2.plot(bin_centers, cdf, 'g-', linewidth=2, color='#00ff88')
-        self.ax2.fill_between(bin_centers, 0, cdf, alpha=0.3, color='#00ff88')
-        self.ax2.set_xlabel("Pixel Intensity", color='#d4d4d4')
-        self.ax2.set_ylabel("Cumulative Probability", color='#d4d4d4')
-        self.ax2.grid(True, alpha=0.3, color='#3a3a3a')
-        self.ax2.set_facecolor('#1e1e1e')
-        self.ax2.tick_params(colors='#d4d4d4')
-        self.ax2.set_title("Cumulative Distribution", color='#d4d4d4')
-        self.ax2.set_ylim(0, 1.05)
-        self.canvas2.draw()
-
-    def _update_stats(self, roi):
-        mean = roi.mean()
-        std = roi.std()
-        min_val = roi.min()
-        max_val = roi.max()
-        median = np.median(roi)
-        self.stats_label.setText(f"Mean: {mean:.2f}\nStd Dev: {std:.2f}\nMin: {min_val}\nMax: {max_val}\nMedian: {median:.2f}")
-
-    def _update_equalized(self, roi):
-        if roi.size == 0:
-            return
-        eq = cv2.equalizeHist(roi)
-        h, w = eq.shape[:2]
-        display_h = self.eq_label.height()
-        if display_h > 10:
-            scale = display_h / h
-            new_w = int(w * scale)
-            if new_w > 0:
-                eq_resized = cv2.resize(eq, (new_w, display_h))
-                self._render_image_to_label(eq_resized, self.eq_label)
-
-    def _render_image(self, bgr_image):
-        label_size = self.image_label.size()
-        if label_size.width() <= 0 or label_size.height() <= 0:
-            return
-        h, w = bgr_image.shape[:2]
-        if w > 0 and h > 0:
-            scale = min(label_size.width() / w, label_size.height() / h)
-            new_w = int(w * scale)
-            new_h = int(h * scale)
-            if new_w > 0 and new_h > 0:
-                resized = cv2.resize(bgr_image, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
-                self._render_image_to_label(resized, self.image_label)
-
-    def _render_image_to_label(self, image, label):
-        if len(image.shape) == 2:
-            rgb = cv2.cvtColor(image, cv2.COLOR_GRAY2RGB)
-        elif len(image.shape) == 3 and image.shape[2] == 3:
-            rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        else:
-            rgb = image
-        h, w, ch = rgb.shape
-        bytes_per_line = ch * w
-        qt_image = QImage(rgb.data, w, h, bytes_per_line, QImage.Format_RGB888)
-        pixmap = QPixmap.fromImage(qt_image)
-        label.setPixmap(pixmap)
-
-    def _export_histogram(self):
-        if self._last_image is None:
-            return
-        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = f"histogram_data_{timestamp}.txt"
-        if self.histogram_type == "Full":
-            roi = self._last_image
-        elif self.histogram_type == "Region":
-            h, w = self._last_image.shape[:2]
-            margin_x = int(w * (1 - self.region_fraction) / 2)
-            margin_y = int(h * (1 - self.region_fraction) / 2)
-            roi = self._last_image[margin_y:h - margin_y, margin_x:w - margin_x]
-        else:
-            h, w = self._last_image.shape[:2]
-            crop_size = int(min(h, w) * self.region_fraction)
-            margin_x = (w - crop_size) // 2
-            margin_y = (h - crop_size) // 2
-            roi = self._last_image[margin_y:margin_y + crop_size, margin_x:margin_x + crop_size]
-        hist = cv2.calcHist([roi], [0], None, [self.hist_bins], [0, 256])
-        with open(filename, 'w') as f:
-            f.write("# Histogram data\n")
-            f.write(f"# Timestamp: {timestamp}\n")
-            f.write(f"# Type: {self.histogram_type}\n")
-            f.write(f"# Bins: {self.hist_bins}\n")
-            f.write(f"# Region fraction: {self.region_fraction:.2f}\n")
-            f.write("# Intensity\tFrequency\n")
-            bin_edges = np.linspace(0, 256, self.hist_bins + 1)
-            bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
-            for i, (center, freq) in enumerate(zip(bin_centers, hist.flatten())):
-                f.write(f"{center:.2f}\t{freq:.0f}\n")
+        try:
+            hist, edges = np.histogram(image.flatten(), bins=256, range=(0, 255))
+            self.ax.clear()
+            bin_width = edges[1] - edges[0]
+            self.ax.bar(edges[:-1], hist, width=bin_width, align='edge', color='#5b86ad', alpha=0.85)
+            self.ax.set_xlabel("Intensity", color='#8a8b90')
+            self.ax.set_ylabel("Frequency", color='#8a8b90')
+            self.ax.grid(True, alpha=0.15, color='#3a3b40')
+            self.ax.set_facecolor('#1a1b1e')
+            self.ax.tick_params(colors='#8a8b90')
+            self.ax.set_xlim(0, 255)
+            mean_val = np.mean(image)
+            std_val = np.std(image)
+            self.ax.set_title(f"MEAN: {mean_val:.1f}  STD: {std_val:.1f}", color='#cfd0d4')
+            self.canvas.draw()
+        except Exception as e:
+            print(f"Histogram update error: {e}")
 
     def closeEvent(self, event):
         """Stops the refresh timer so the window doesn't keep polling after it's closed."""
@@ -1836,6 +1732,47 @@ class OutputLogWindow(QMainWindow):
 
 
 # ==========================================
+# NUDGE LINE EDIT
+# ==========================================
+class NudgeLineEdit(QLineEdit):
+    """QLineEdit for a numeric hardware setting (exposure, gain) that applies
+    immediately instead of requiring a separate mouse click on an Apply
+    button: Up/Down arrow keys nudge the value by `step` and apply it right
+    away, and Enter applies whatever was typed. The Apply button stays around
+    for mouse-only use, calling the same callback."""
+
+    def __init__(self, step=1.0, minimum=0.0, maximum=1000.0, decimals=1, parent=None):
+        super().__init__(parent)
+        self.step = step
+        self.minimum = minimum
+        self.maximum = maximum
+        self.decimals = decimals
+        self.apply_callback = None
+        self.returnPressed.connect(self._apply)
+
+    def set_apply_callback(self, callback):
+        self.apply_callback = callback
+
+    def _apply(self):
+        if self.apply_callback is not None:
+            self.apply_callback()
+
+    def keyPressEvent(self, event):
+        if event.key() in (Qt.Key_Up, Qt.Key_Down):
+            try:
+                val = float(self.text())
+            except ValueError:
+                val = 0.0
+            val += self.step if event.key() == Qt.Key_Up else -self.step
+            val = max(self.minimum, min(self.maximum, val))
+            self.setText(f"{val:.{self.decimals}f}")
+            self._apply()
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+
+# ==========================================
 # MAIN APP
 # ==========================================
 class TEMViewerApp(QMainWindow):
@@ -1861,10 +1798,21 @@ class TEMViewerApp(QMainWindow):
         self._last_frame_time = time.time()
         self._fps_counter = 0
         self._fps_timer = time.time()
+        self._last_processed_frame = None
 
         # Video output path
         self.video_output_path = os.getcwd()
         self.output_file = None
+        # Records segment filenames in the order they were *recorded* (see
+        # _record_segment_order), so final concatenation can follow that
+        # instead of self.output_files' append order, which is really
+        # *completion* order and can differ when background flushes for
+        # different segments finish out of sequence.
+        self._segment_order = []
+        self.segment_manifest_path = os.path.join(
+            self.video_output_path,
+            datetime.datetime.now().strftime("%Y%m%d_%H%M%S") + "_segments.json"
+        )
         self._update_output_filename()
 
         # Audio settings
@@ -1879,6 +1827,10 @@ class TEMViewerApp(QMainWindow):
         self.writer = None
         self._writer_started = False
         self.output_files = []
+        # Writers retired by "Record OFF" (see _stop_recording) - their
+        # background flush is still in flight, kept here just so their
+        # finished segment gets collected into output_files once done.
+        self._retiring_writers = []
 
         # Flat field reference frames
         self.D = None
@@ -1929,11 +1881,11 @@ class TEMViewerApp(QMainWindow):
         self.microscope_mode = "Image Mode"
 
         # Encoding settings
-        self.encoder_choice = "GPU (hevc_nvenc) - Fast"
+        self.encoder_choice = "CPU (libx265) - Smallest"
         self.encoding_mode = "High Quality (CQ)"
         self.cq_value = "12"
         self.bitrate_value = "8M"
-        self.manual_gain = 6.0
+        self.manual_gain = 20.0
 
         # UI Update flag to prevent unwanted parameter triggering
         self._updating_param_ui = False
@@ -1959,6 +1911,40 @@ class TEMViewerApp(QMainWindow):
     def _update_output_filename(self):
         now = datetime.datetime.now()
         self.output_file = os.path.join(self.video_output_path, now.strftime("%Y%m%d_%H%M%S") + "_output.mkv")
+        self._record_segment_order(self.output_file)
+
+    def _record_segment_order(self, filename):
+        """Appends filename to the session's segment-order manifest (JSON,
+        both kept in memory and written to segment_manifest_path), so final
+        concatenation can replay segments in the order they were *recorded*.
+        self.output_files, by contrast, is appended to in flush-*completion*
+        order - background flushes for different segments can finish out of
+        sequence (a bigger/slower segment queued before a smaller/faster
+        one), which was silently reordering the concatenated output."""
+        self._segment_order.append(filename)
+        try:
+            with open(self.segment_manifest_path, 'w') as f:
+                json.dump({"segments": self._segment_order}, f, indent=2)
+        except Exception as e:
+            print(f"Error writing segment manifest: {e}")
+
+    def _ordered_output_files(self):
+        """Returns self.output_files reordered to match the segment manifest's
+        recording order, falling back to self.output_files' own order if the
+        manifest can't be read. See _record_segment_order for why the
+        manifest, not append order, is the correct source of truth here."""
+        try:
+            with open(self.segment_manifest_path, 'r') as f:
+                manifest = json.load(f).get("segments", [])
+        except Exception as e:
+            self._log_message(f"Could not read segment manifest ({e}), using recorded order as-is")
+            return self.output_files
+        ordered = [name for name in manifest if name in self.output_files]
+        # Anything successfully flushed but somehow missing from the
+        # manifest (shouldn't happen) - keep it rather than silently
+        # dropping a segment from the final video.
+        ordered.extend(name for name in self.output_files if name not in ordered)
+        return ordered
 
     def _apply_theme(self, theme):
         """Switch between the dark and light QSS themes and refresh the handful
@@ -2187,12 +2173,18 @@ class TEMViewerApp(QMainWindow):
             return
         if self.gain_btn.isChecked():
             try:
-                # FIX: Limit AEAG's exposure to your current manual exposure (e.g., 40ms)
-                # This prevents AEAG from using 100ms+ and dropping FPS to 10.
-                self.cam.set_param('ae_max_limit', int(self.exposure * 1000))
+                # Give AEAG real headroom to react to the scene, bounded well
+                # below values that would tank FPS - not pinned to whatever
+                # the current manual exposure happens to be, which left it
+                # with ~zero room to ever brighten a dim image (see
+                # AEAG_MAX_EXPOSURE_MS above for why).
+                self.cam.set_param('ae_max_limit', int(AEAG_MAX_EXPOSURE_MS * 1000))
                 self.cam.set_param('ag_max_limit', 40.0)
 
-                # FIX: Switch to Frame Rate Limit mode to lock it at 25 FPS
+                # Frame Rate Limit mode targets 25 FPS but will still drop
+                # below it if AEAG picks a longer exposure than that allows -
+                # that's expected: correct exposure takes priority over
+                # strictly hitting 25 FPS while AEAG is driving.
                 self.cam.set_param('acq_timing_mode', 'XI_ACQ_TIMING_MODE_FRAME_RATE_LIMIT')
                 self.cam.set_param('framerate', 25.0)
 
@@ -2201,7 +2193,7 @@ class TEMViewerApp(QMainWindow):
                 self.gain_btn.setText("Auto Exposure/Gain (AEAG): ON")
                 self.gain_input.setEnabled(False)
                 self.apply_gain_btn.setEnabled(False)
-                self._log_message("Camera AEAG (Auto Exposure/Gain) ENABLED: Capped at 25 FPS")
+                self._log_message(f"Camera AEAG (Auto Exposure/Gain) ENABLED: exposure up to {AEAG_MAX_EXPOSURE_MS:.0f}ms, target 25 FPS")
             except Exception as e:
                 self._log_message(f"Error enabling AEAG: {e}")
         else:
@@ -2254,48 +2246,48 @@ class TEMViewerApp(QMainWindow):
             # CHANGED: Diffraction mode settings
             self.gamma = 1.00 # Reset gamma to 1.00 for unbiased diffraction data
             self.gamma_slider.setValue(100)
-            
-            self.exposure = 200.0
+
+            self.exposure = 40.0
             self.manual_gain = 20.0
-            
+
             if self.camera_connected and self.cam is not None:
                 if self.cam.is_aeag():
                     self._log_message("AEAG is active - disabling it to apply Diffraction Mode's fixed gain/exposure")
                     self._disable_aeag()
                 self.cam.set_gain(20.0)
-                self.cam.set_exposure(int(200.0 * 1000))
+                self.cam.set_exposure(int(40.0 * 1000))
                 actual_ms = float(self.cam.get_exposure()) / 1000.0
-                self._log_message("Diffraction Mode: Gain=20dB, Exposure=200ms, Processing OFF, Lossless Recording.")
-                self._log_message(f"Exposure requested 200.0ms, camera reports {actual_ms:.1f}ms")
+                self._log_message("Diffraction Mode: Gain=20dB, Exposure=40ms, Processing OFF, Lossless Recording.")
+                self._log_message(f"Exposure requested 40.0ms, camera reports {actual_ms:.1f}ms")
             else:
                 self.gain_input.setText("20.0")
-                self.exposure_input.setText("200.0")
+                self.exposure_input.setText("40.0")
                 self._log_message("Diffraction Mode (No Camera): Software settings changed.")
         else:
-            self.processing_worker.contrast_method = 1
+            self.processing_worker.contrast_method = 0
             self.processing_worker.enable_flatfield = True
-            self.contrast_method_group.button(1).setChecked(True)
+            self.contrast_method_group.button(0).setChecked(True)
             self.ff_cb.setChecked(True)
-            self.encoder_combo.setCurrentText("GPU (hevc_nvenc) - Fast")
-            
+            self.encoder_combo.setCurrentText("CPU (libx265) - Smallest")
+
             # CHANGED: Image mode settings
-            self.gamma = 1.00 
+            self.gamma = 1.00
             self.gamma_slider.setValue(100)
-            
+
             self.exposure = 40.0
-            self.manual_gain = 6.0
-            
+            self.manual_gain = 20.0
+
             if self.camera_connected and self.cam is not None:
                 if self.cam.is_aeag():
                     self._log_message("AEAG is active - disabling it to apply Image Mode's fixed gain/exposure")
                     self._disable_aeag()
-                self.cam.set_gain(6.0)
+                self.cam.set_gain(20.0)
                 self.cam.set_exposure(int(40.0 * 1000))
                 actual_ms = float(self.cam.get_exposure()) / 1000.0
-                self._log_message(f"Image Mode: Gain={6.0}dB, Exposure=40ms, CLAHE ON, Flat-field ON, GPU Recording.")
+                self._log_message("Image Mode: Gain=20dB, Exposure=40ms, Autocontrast ON, Flat-field ON, CPU (libx265) Recording.")
                 self._log_message(f"Exposure requested 40.0ms, camera reports {actual_ms:.1f}ms")
             else:
-                self.gain_input.setText("6.0")
+                self.gain_input.setText("20.0")
                 self.exposure_input.setText("40.0")
                 self._log_message("Image Mode (No Camera): Software settings changed.")
 
@@ -2542,22 +2534,46 @@ class TEMViewerApp(QMainWindow):
             self._log_message("Recording STOPPED")
 
     def _stop_recording(self):
-        """Flush and close the active writer if a recording is in progress, collecting
-        any finished segments into self.output_files. Shared by the Record button and
-        manual disconnect, so disconnecting doesn't leave a recording pending an
-        eventual reconnect/quit to actually save it."""
+        """Stops the active writer from accepting new frames and flushes its
+        buffered segment to disk in the background - the same async path
+        Pause already uses - instead of final_flush's blocking encode, which
+        used to freeze the whole display (the GUI thread can't repaint while
+        it's stuck waiting on ffmpeg) for however long the segment took to
+        encode. The old writer is parked in _retiring_writers, reaped once
+        its background flush finishes (see _reap_retiring_writers), so its
+        output file still ends up in self.output_files. Shared by the Record
+        button and manual disconnect, so disconnecting doesn't leave a
+        recording pending an eventual reconnect/quit to actually save it."""
         if self.writer is None:
             return
-        try:
-            success = self.writer.final_flush(self.output_file, self.width, self.height, fps=self.fps)
-            if success:
-                self.output_files.append(self.output_file)
-            self.output_files.extend(self.writer._output_files)
-            self.writer.close()
-        except Exception as e:
-            self._log_message(f"Error stopping recording: {e}")
+        old_writer = self.writer
         self.writer = None
         self.paused = False
+        try:
+            flushed = old_writer.pause_and_flush(self.output_file, self.width, self.height, fps=self.fps)
+            if flushed:
+                self._retiring_writers.append(old_writer)
+            else:
+                old_writer.close()
+        except Exception as e:
+            self._log_message(f"Error stopping recording: {e}")
+
+    def _reap_retiring_writers(self):
+        """Collects output files from writers retired by _stop_recording once
+        their background flush has finished, and drops them from the retiring
+        list. Cheap to call often - a list of at most a couple of writers,
+        checked with a non-blocking is_alive()."""
+        if not self._retiring_writers:
+            return
+        still_flushing = []
+        for writer in self._retiring_writers:
+            thread = writer._flush_thread
+            if thread is not None and thread.is_alive():
+                still_flushing.append(writer)
+            else:
+                self.output_files.extend(writer._output_files)
+                writer.close()
+        self._retiring_writers = still_flushing
 
     def _on_pause_toggle(self):
         if self.writer is None:
@@ -2661,6 +2677,7 @@ class TEMViewerApp(QMainWindow):
         if drift_method == 1 and self.csv_file:
             timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")
             self.csv_file.write(f"{self.frames_read},{drift_dx},{drift_dy},{drift_reliability},{timestamp}\n")
+            self.csv_file.flush()
 
         # Pass UI settings to worker
         self.processing_worker.brightness = self.brightness
@@ -2685,11 +2702,18 @@ class TEMViewerApp(QMainWindow):
                 pass
         self.raw_queue.put(raw_image.copy())
 
-        # Wait for worker to process
+        # Pull whatever the worker has ready, without blocking. Camera capture
+        # must never wait on the processing pipeline - a blocking get() here
+        # used to tie the measured/actual FPS directly to CLAHE/NLM throughput
+        # (e.g. worker at 4fps -> acquisition also stalls to ~4fps). If the
+        # worker hasn't produced a fresh frame yet, reuse the last processed
+        # one so display/recording stay smooth while acquisition keeps running
+        # at the camera's real rate.
         try:
-            processed_for_display = self.display_queue.get(timeout=0.2)
+            processed_for_display = self.display_queue.get_nowait()
+            self._last_processed_frame = processed_for_display
         except queue.Empty:
-            processed_for_display = raw_image
+            processed_for_display = self._last_processed_frame if self._last_processed_frame is not None else raw_image
 
         record_image = processed_for_display
         if record_image.dtype != np.uint8:
@@ -2968,10 +2992,12 @@ class TEMViewerApp(QMainWindow):
 
         exp_layout = QHBoxLayout()
         exp_layout.addWidget(QLabel("Exposure (ms):"))
-        self.exposure_input = QLineEdit()
+        self.exposure_input = NudgeLineEdit(step=1.0, minimum=0.1, maximum=1000.0, decimals=1)
         self.exposure_input.setText("40.0")
         self.exposure_input.setFixedWidth(60)
+        self.exposure_input.setToolTip("Up/Down arrows nudge and apply immediately; Enter applies whatever is typed.")
         self.exposure_input.textChanged.connect(self._on_exposure_changed)
+        self.exposure_input.set_apply_callback(self._apply_exposure)
         exp_layout.addWidget(self.exposure_input)
         self.apply_exp_btn = QPushButton("Apply")
         self.apply_exp_btn.clicked.connect(self._apply_exposure)
@@ -3003,10 +3029,11 @@ class TEMViewerApp(QMainWindow):
 
         gain_layout = QHBoxLayout()
         gain_layout.addWidget(QLabel("Manual Gain (dB):"))
-        self.gain_input = QLineEdit()
-        self.gain_input.setText("6.0")
+        self.gain_input = NudgeLineEdit(step=0.5, minimum=0.0, maximum=40.0, decimals=1)
+        self.gain_input.setText("20.0")
         self.gain_input.setFixedWidth(60)
-        self.gain_input.textChanged.connect(lambda text: None)
+        self.gain_input.setToolTip("Up/Down arrows nudge and apply immediately; Enter applies whatever is typed.")
+        self.gain_input.set_apply_callback(self._apply_manual_gain)
         gain_layout.addWidget(self.gain_input)
         gain_layout.addStretch()
         hw_layout.addLayout(gain_layout)
@@ -3028,6 +3055,7 @@ class TEMViewerApp(QMainWindow):
             "CPU (libx265) - Smallest",
             "Lossless (ffv1) - Scientific"
         ])
+        self.encoder_combo.setCurrentText("CPU (libx265) - Smallest")
         self.encoder_combo.currentTextChanged.connect(self._on_encoder_changed)
         enc_layout.addWidget(self.encoder_combo)
         enc_layout.addWidget(QLabel("Encoding Mode:"))
@@ -3130,12 +3158,12 @@ class TEMViewerApp(QMainWindow):
         contrast_method_layout = QVBoxLayout(contrast_method_group)
         self._tighten(contrast_method_layout)
         self.contrast_method_group = QButtonGroup()
-        rb_auto = QRadioButton("Autocontrast")
-        rb_auto.setChecked(False)
+        rb_auto = QRadioButton("Autocontrast (Recommended)")
+        rb_auto.setChecked(True)
         self.contrast_method_group.addButton(rb_auto, 0)
         contrast_method_layout.addWidget(rb_auto)
-        rb_clahe = QRadioButton("CLAHE (Recommended)")
-        rb_clahe.setChecked(True)
+        rb_clahe = QRadioButton("CLAHE")
+        rb_clahe.setChecked(False)
         self.contrast_method_group.addButton(rb_clahe, 1)
         contrast_method_layout.addWidget(rb_clahe)
         rb_none = QRadioButton("None")
@@ -3155,7 +3183,7 @@ class TEMViewerApp(QMainWindow):
             self.filter_group.addButton(rb, val)
             filter_layout.addWidget(rb)
 
-        self.nlm_cb = QCheckBox("NLM Denoising")
+        self.nlm_cb = QCheckBox("NLM Denoising" if not self.processing_worker.use_gpu else "Bilateral Denoising (GPU)")
         self.nlm_cb.setChecked(False)
         self.nlm_cb.stateChanged.connect(self._on_nlm_toggle)
         filter_layout.addWidget(self.nlm_cb)
@@ -3175,6 +3203,33 @@ class TEMViewerApp(QMainWindow):
             self.drift_group.addButton(rb, val)
             drift_layout.addWidget(rb)
         self.drift_group.buttonClicked.connect(self._on_drift_change)
+
+        edge_params_row = QHBoxLayout()
+        edge_params_row.addWidget(QLabel("Margin:"))
+        self.edge_margin_spin = QSpinBox()
+        self.edge_margin_spin.setRange(0, 400)
+        self.edge_margin_spin.setValue(0)
+        self.edge_margin_spin.setToolTip(
+            "How far in from the true frame edge to sample for tracking texture\n"
+            "(this also trims each strip's ends inward by the same amount, so\n"
+            "it stays clear of the corners too). Raise this if your footage has\n"
+            "a black vignette/circular border - sampling right at pixel 0, or a\n"
+            "strip that still runs through the corners, lands partly or wholly\n"
+            "on blank vignette with nothing to track, which is why edge-strip\n"
+            "correction can silently do nothing no matter how much the sample\n"
+            "actually drifts."
+        )
+        self.edge_margin_spin.valueChanged.connect(self._on_edgestrip_params_changed)
+        edge_params_row.addWidget(self.edge_margin_spin)
+        edge_params_row.addWidget(QLabel("Width:"))
+        self.edge_width_spin = QSpinBox()
+        self.edge_width_spin.setRange(8, 200)
+        self.edge_width_spin.setValue(40)
+        self.edge_width_spin.setToolTip("Thickness of the sampled band, in pixels.")
+        self.edge_width_spin.valueChanged.connect(self._on_edgestrip_params_changed)
+        edge_params_row.addWidget(self.edge_width_spin)
+        drift_layout.addLayout(edge_params_row)
+
         self.toolbar_layout.addWidget(drift_group)
 
         self.toolbar_layout.addStretch()
@@ -3308,6 +3363,14 @@ class TEMViewerApp(QMainWindow):
                 self._log_message("ROI selection started - click and drag on the preview")
         self._prev_drift_choice = new_val
 
+    def _on_edgestrip_params_changed(self):
+        """Applies the margin/width spinboxes to the edge-strip tracker and
+        re-anchors it, since changing where the strips are sampled from
+        invalidates whatever reference strips it already had cached."""
+        self.drift_tracker.strip_width = self.edge_width_spin.value()
+        self.drift_tracker.margin = self.edge_margin_spin.value()
+        self.tracker_initialized = False
+
     def _on_reset(self):
         """Restore every processing/display setting to its startup default. Camera
         hardware (exposure/gain), microscope mode, encoder, and audio settings are
@@ -3319,6 +3382,8 @@ class TEMViewerApp(QMainWindow):
         self.roi_tracker.reset()
         self.drift_tracker.reset()
         self.tracker_initialized = False
+        self.edge_margin_spin.setValue(0)
+        self.edge_width_spin.setValue(40)
         for btn in self.drift_group.buttons():
             if self.drift_group.id(btn) == 0:
                 btn.setChecked(True)
@@ -3328,8 +3393,8 @@ class TEMViewerApp(QMainWindow):
         self.brightness_slider.setValue(0)
         self.contrast_slider.setValue(100)
 
-        self.contrast_method_group.button(1).setChecked(True)  # CLAHE
-        self.processing_worker.contrast_method = 1
+        self.contrast_method_group.button(0).setChecked(True)  # Autocontrast
+        self.processing_worker.contrast_method = 0
 
         self.filter_group.button(0).setChecked(True)  # None
         self.gaussian_kernel_input.setText("3")
@@ -3459,24 +3524,53 @@ class TEMViewerApp(QMainWindow):
             self._update_status_labels()
         else:
             self._render_black_screen()
+        self._reap_retiring_writers()
 
     def _render_to_label(self, bgr_image):
+        """Converts/draws overlays on the frame at its native camera resolution
+        (a fixed cost) and lets Qt's own pixmap scaler fit it to the label,
+        instead of cv2.resize-ing to the label's size first. The old order
+        made the per-frame CPU cost scale with the *display* size - harmless
+        in a small windowed panel, but a real cost jump once the label became
+        a full monitor in fullscreen, which is what was pulling fullscreen FPS
+        down relative to windowed. Fast (nearest-neighbor) transformation is
+        used since this is a live instrument feed, not a stored image."""
         h, w = bgr_image.shape[:2]
         label_size = self.image_label.size()
         if label_size.width() <= 0 or label_size.height() <= 0:
             return
         if w > 0 and h > 0:
-            scale = min(label_size.width() / w, label_size.height() / h)
-            new_w = int(w * scale)
-            new_h = int(h * scale)
-            if new_w > 0 and new_h > 0:
-                resized = cv2.resize(bgr_image, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
-                rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
-                h, w, ch = rgb.shape
-                bytes_per_line = ch * w
-                qt_image = QImage(rgb.data, w, h, bytes_per_line, QImage.Format_RGB888)
-                pixmap = QPixmap.fromImage(qt_image)
-                self.image_label.setPixmap(pixmap)
+            display = self._draw_drift_overlay(bgr_image)
+            rgb = cv2.cvtColor(display, cv2.COLOR_BGR2RGB)
+            rgb = np.ascontiguousarray(rgb)
+            bytes_per_line = rgb.shape[1] * 3
+            qt_image = QImage(rgb.data, w, h, bytes_per_line, QImage.Format_RGB888)
+            pixmap = QPixmap.fromImage(qt_image)
+            scaled = pixmap.scaled(label_size, Qt.KeepAspectRatio, Qt.FastTransformation)
+            self.image_label.setPixmap(scaled)
+
+    def _draw_drift_overlay(self, bgr_image):
+        """Draws the active drift-correction overlay (edge-strip boxes or the
+        ROI template/selection box) on a full-resolution copy of bgr_image,
+        mirroring tem_video_processor.py's _update_display. Mouse handlers in
+        this file already convert clicks to full-frame coordinates (unlike
+        tem_video_processor.py, which stores display coordinates), so
+        template_pos/selection rects here need no further scaling."""
+        drift_method = self._prev_drift_choice
+        if drift_method == 1:
+            return self.drift_tracker.draw_overlay(bgr_image, color=(0, 220, 130))
+        if drift_method == 2:
+            display = bgr_image.copy()
+            if self.roi_tracker.roi_locked and self.roi_tracker.template_pos:
+                x, y, tw, th = self.roi_tracker.template_pos
+                cv2.rectangle(display, (x, y), (x + tw, y + th), (0, 220, 130), 2)
+            elif self.roi_tracker.selecting and self.roi_tracker.selection_start is not None:
+                rect = self.roi_tracker.get_selection_rect()
+                if rect:
+                    sx, sy, sw, sh = rect
+                    cv2.rectangle(display, (sx, sy), (sx + sw, sy + sh), (255, 165, 0), 2)
+            return display
+        return bgr_image
 
     def _render_black_screen(self):
         label_size = self.image_label.size()
@@ -3635,7 +3729,23 @@ class TEMViewerApp(QMainWindow):
                 self.writer.close()
             except Exception as e:
                 print(f"Error closing writer: {e}")
-        
+
+        # Wait out any writer(s) retired by an earlier "Record OFF" whose
+        # background flush was still running - unlike during normal live
+        # operation, blocking here is fine (and necessary): the app is
+        # already exiting, and any segment still in flight needs to land on
+        # disk and get collected before concatenation runs below.
+        for writer in self._retiring_writers:
+            try:
+                if writer._flush_thread and writer._flush_thread.is_alive():
+                    self._log_message("Waiting for a pending recording flush to finish...")
+                    writer._flush_thread.join(timeout=60)
+                self.output_files.extend(writer._output_files)
+                writer.close()
+            except Exception as e:
+                print(f"Error collecting retired writer output: {e}")
+        self._retiring_writers = []
+
         try:
             if self.cam is not None:
                 self._log_message("Disconnecting camera...")
@@ -3660,7 +3770,7 @@ class TEMViewerApp(QMainWindow):
             self._log_message(f"{'='*60}")
             session_time = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
             final_output = os.path.join(self.video_output_path, f"session_{session_time}_concat.mkv")
-            success = self._concatenate_videos(self.output_files, final_output)
+            success = self._concatenate_videos(self._ordered_output_files(), final_output)
             if success:
                 self._log_message(f"\n✓ All segments concatenated into: {final_output}")
             else:
